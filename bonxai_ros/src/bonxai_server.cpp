@@ -192,10 +192,18 @@ void BonxaiServer::init_publishers()
       "/bonxai/occupancy_stats",
       rclcpp::QoS(10));
     
-    occupied_voxel_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "/bonxai/occupied_voxels",rclcpp::QoS(10));
-  
     RCLCPP_INFO(get_logger(), "Stats publisher created: /bonxai/occupancy_stats");
+
+    // stats.publish_occupied_voxels was declared and logged but never checked,
+    // so the occupied-voxel cloud was published unconditionally — and building
+    // it walks every active cell on each stats tick, which is exactly the cost
+    // this switch exists to avoid.
+    if (params_.publish_occupied_voxels) {
+      occupied_voxel_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/bonxai/occupied_voxels", rclcpp::QoS(10));
+
+      RCLCPP_INFO(get_logger(), "Occupied voxel publisher created: /bonxai/occupied_voxels");
+    }
   }
 }
 
@@ -319,7 +327,18 @@ void BonxaiServer::pointcloud_callback(const sensor_msgs::msg::PointCloud2::Cons
     transform_stamped.transform.rotation.y,
     transform_stamped.transform.rotation.z
   );
-  
+
+  // A diverged localiser can publish a non-finite transform. Every point
+  // derived from it would be NaN, poisoning the map. Drop the cloud instead.
+  if (!sensor_origin.allFinite() || !rotation.coeffs().allFinite()) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Transform %s -> %s is not finite; dropping cloud",
+      msg->header.frame_id.c_str(), params_.frame_id.c_str());
+    return;
+  }
+
+
   // Transform points to map frame and filter by Z
   std::vector<Eigen::Vector3d> map_points;
   map_points.reserve(cloud->size());
@@ -620,16 +639,18 @@ void BonxaiServer::stats_timer_callback()
     return;
   }
   
-  sensor_msgs::msg::PointCloud2 pcl_msg;
   std::vector<Bonxai::CoordT> coords;
-  occupancy_map_->getOccupiedVoxels(coords);
-  fill_pcl_msg(coords,pcl_msg);
+  if (occupied_voxel_publisher_) {
+    sensor_msgs::msg::PointCloud2 pcl_msg;
+    occupancy_map_->getOccupiedVoxels(coords);
+    fill_pcl_msg(coords, pcl_msg);
+    occupied_voxel_publisher_->publish(pcl_msg);
+  }
 
   bonxai_msgs::msg::OccupancyMapStats msg;
   fill_stats_msg(msg);
   
   stats_publisher_->publish(msg);
-  occupied_voxel_publisher_->publish(pcl_msg);
 
   // Debug: this runs at stats_publish_rate (3 Hz by default), and at info level
   // it buries everything else in the log.

@@ -506,6 +506,17 @@ void RollingBonxaiServer::pointcloudCallback(
     tf.transform.rotation.y,
     tf.transform.rotation.z);
 
+  // A diverged localiser can publish a non-finite transform. Every point
+  // derived from it would be NaN, poisoning the chunk the sensor sits in.
+  // Drop the cloud rather than letting that reach the map.
+  if (!origin.allFinite() || !q.coeffs().allFinite()) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Transform %s -> %s is not finite; dropping cloud",
+      msg->header.frame_id.c_str(), server_params_.frame_id.c_str());
+    return;
+  }
+
   std::vector<Eigen::Vector3d> pts;
   pts.reserve(cloud->size());
 

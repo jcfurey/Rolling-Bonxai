@@ -178,7 +178,7 @@ All parameters are scoped under `rolling_bonxai_server_node/ros__parameters/`. T
 | Parameter | Type | Default | Unit / Significance |
 |-----------|------|---------|---------------------|
 | `frame_id` | string | `"map"` | The global fixed frame. All map data is stored in this frame. |
-| `base_frame_id` | string | `"base_footprint"` | The robot base frame used for TF lookups. |
+| `base_frame_id` | string | `"base_footprint"` | **Currently unused.** Reserved for future base-frame queries. TF lookups resolve the incoming cloud's own `header.frame_id` to `frame_id`, so changing this has no effect today. |
 | `topic_in` | string | `"/points"` | The `sensor_msgs/PointCloud2` topic to subscribe to. **Must match your sensor's output topic.** |
 
 ### Occupancy Settings (`occupancy.*`)

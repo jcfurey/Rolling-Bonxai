@@ -7,6 +7,8 @@ bonxai_server_node:
     use_sim_time: false
 
     frame_id: "map"
+    # Currently unused — TF lookups resolve the incoming cloud's own
+    # header.frame_id to frame_id. Reserved for future base-frame queries.
     base_frame_id: "zed_camera_link"
     topic_in: "/zed/zed_node/point_cloud/cloud_registered"
 

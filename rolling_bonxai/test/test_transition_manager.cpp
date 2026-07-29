@@ -1,4 +1,8 @@
 #include <gtest/gtest.h>
+
+#include <limits>
+#include <sstream>
+
 #include "rolling_bonxai/transition_manager.hpp"
 #include "rolling_bonxai/coordinate_system.hpp"
 
@@ -606,6 +610,62 @@ TEST_F(TransitionManagerTest, PenetrationCalculationFaceTransition) {
         EXPECT_EQ(tm_->getRefTransitionState(), test.expected_state)
             << "Failed at x=" << test.x << " (penetration=" << test.expected_penetration << ")";
     }
+}
+
+// ============================================================================
+// NON-FINITE EGO POSES
+// ============================================================================
+//
+// shouldTriggerTransition() runs inside the point cloud subscription callback,
+// so anything it throws escapes the executor and terminates the node. A NaN
+// from a diverged localiser used to do exactly that: every comparison in
+// isPositionInChunk() is false for NaN, so distanceToBoundary() reported the
+// ego as outside the chunk it had just been classified into, which produced
+// UNINITIALIZED and hit the throw. These pin the non-throwing behaviour.
+
+TEST_F(TransitionManagerTest, NonFinitePositionDoesNotThrowBeforeInit) {
+    auto nan_ctx = makeContext(std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0);
+
+    EXPECT_NO_THROW({
+        EXPECT_FALSE(tm_->shouldTriggerTransition(nan_ctx));
+    });
+}
+
+TEST_F(TransitionManagerTest, NonFinitePositionDoesNotThrowAfterInit) {
+    // Initialise normally at the origin
+    auto ctx = makeContext(0.0, 0.0, 0.0);
+    EXPECT_TRUE(tm_->shouldTriggerTransition(ctx));
+
+    const ChunkCoord chunk_before = tm_->getRefChunkCoord();
+    const TransitionState state_before = tm_->getRefTransitionState();
+
+    for (double bad : {std::numeric_limits<double>::quiet_NaN(),
+                       std::numeric_limits<double>::infinity(),
+                       -std::numeric_limits<double>::infinity()}) {
+        auto bad_ctx = makeContext(bad, 0.0, 0.0);
+        EXPECT_NO_THROW({
+            EXPECT_FALSE(tm_->shouldTriggerTransition(bad_ctx));
+        });
+
+        // A bad pose must not disturb the state machine either
+        EXPECT_EQ(tm_->getRefChunkCoord(), chunk_before);
+        EXPECT_EQ(tm_->getRefTransitionState(), state_before);
+    }
+}
+
+TEST_F(TransitionManagerTest, RecoversAfterNonFinitePosition) {
+    auto ctx = makeContext(0.0, 0.0, 0.0);
+    tm_->shouldTriggerTransition(ctx);
+
+    auto nan_ctx = makeContext(std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0);
+    EXPECT_FALSE(tm_->shouldTriggerTransition(nan_ctx));
+
+    // A valid pose far enough into the next chunk must still transition, i.e.
+    // the bad cycle was skipped rather than latching the manager into a
+    // permanently broken state.
+    auto far_ctx = makeContext(chunk_size_, 0.0, 0.0);
+    EXPECT_TRUE(tm_->shouldTriggerTransition(far_ctx));
+    EXPECT_EQ(tm_->getRefChunkCoord(), ChunkCoord(1, 0, 0));
 }
 
 // ============================================================================

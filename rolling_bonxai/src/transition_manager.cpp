@@ -18,6 +18,17 @@ TransitionManager::TransitionManager(double hyst_ratio, ChunkCoordinateSystem& c
 
 bool TransitionManager::shouldTriggerTransition(const TransitionManagerContext& context)
 {
+    // === REJECT NON-FINITE POSES ===
+    // A NaN or infinity here — an uninitialised odometry source, a diverged
+    // localiser — makes every comparison in isPositionInChunk() false, so the
+    // chunk the position was just classified into reports the position as
+    // outside itself. That used to end in the UNINITIALIZED throw below.
+    // Hold the current state and skip the cycle instead; the next valid pose
+    // resumes normally.
+    if (!context.ego_position.allFinite()) {
+        return false;
+    }
+
     // === INITIALIZATION (First Update) ===
     if (!initialized_) {
         initialized_ = true;
@@ -69,9 +80,17 @@ bool TransitionManager::shouldTriggerTransition(const TransitionManagerContext& 
         ? computeStateIfSameChunk(context, current_chunk_coord)
         : computeStateIfNextChunk(context, current_chunk_coord);
 
-    // Sanity check: should never go back to UNINITIALIZED
+    // Sanity check: should never go back to UNINITIALIZED.
+    //
+    // This is reached when the coordinate system reports the ego as outside the
+    // very chunk it just classified the ego into — a geometric contradiction,
+    // realistically only floating-point behaviour exactly on a chunk boundary.
+    // It used to throw, and since this runs inside the point cloud subscription
+    // callback the exception escaped the executor and took the whole node down.
+    // A mapping node should not die over one bad pose: hold the current state,
+    // trigger no I/O, and let the next update sort itself out.
     if (new_state == TransitionState::UNINITIALIZED) {
-        throw std::runtime_error("TransitionManager: State cannot return to UNINITIALIZED after initialization!");
+        return false;
     }
 
     // === SAME CHUNK CASE ===
