@@ -2,7 +2,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
-#include <eigen3/Eigen/Core>
+#include <Eigen/Core>
 #include "bonxai_map/occupancy_map.hpp"
 
 // ============================================================================

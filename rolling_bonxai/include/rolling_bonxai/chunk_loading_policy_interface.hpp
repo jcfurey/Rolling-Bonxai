@@ -154,7 +154,20 @@ public:
      */
     [[nodiscard]] virtual double getPriority(const ChunkCoord& coord,
                                              const PolicyContext& context) const = 0;
-    
+
+    /**
+     * @brief Chebyshev radius (in chunks) that must be enumerated to find every
+     *        chunk this policy could possibly want loaded
+     *
+     * The orchestrator walks the cube of neighbours within this radius and asks
+     * shouldLoad() about each one. A policy that can accept a chunk outside the
+     * returned radius would simply never see it offered, so implementations must
+     * return an upper bound over every axis, not just the horizontal one.
+     *
+     * @return Radius in chunks (>= 0)
+     */
+    [[nodiscard]] virtual int getSearchRadius() const = 0;
+
     /**
      * @brief Get human-readable name of the policy
      * 

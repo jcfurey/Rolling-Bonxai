@@ -18,7 +18,7 @@ def generate_launch_description():
         '/rolling_bonxai/quick_occupancy_stats',
         '/rolling_bonxai/chunk_markers',
         '/rolling_bonxai/transition_state',
-        "/zed/zed_node/point_cloud/cloud_registered"
+        '/zed/zed_node/point_cloud/cloud_registered'
     ]
 
     START_DELAY_SEC = 2.0  # give nodes time to come up
@@ -34,7 +34,7 @@ def generate_launch_description():
             '--compression-mode', 'file',
             '--compression-format', 'zstd',
             '-o', BAG_NAME,
-            '--topics',*TOPICS,
+            '--topics', *TOPICS,
         ],
         output='screen',
         emulate_tty=True,

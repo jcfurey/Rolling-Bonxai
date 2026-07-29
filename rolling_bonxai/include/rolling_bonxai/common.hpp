@@ -1,5 +1,5 @@
 #pragma once
-#include <eigen3/Eigen/Geometry>
+#include <Eigen/Geometry>
 
 #include <chrono>
 #include <memory>

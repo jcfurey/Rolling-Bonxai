@@ -1,5 +1,11 @@
 bonxai_server_node:
   ros__parameters:
+    # Set true when a simulator (Gazebo, Isaac, a bag replayed with --clock)
+    # publishes /clock. Every timer in the node then follows simulated time
+    # instead of the wall clock. Nothing fires until /clock starts publishing,
+    # which is the expected behaviour.
+    use_sim_time: false
+
     frame_id: "map"
     base_frame_id: "zed_camera_link"
     topic_in: "/zed/zed_node/point_cloud/cloud_registered"
@@ -9,7 +15,7 @@ bonxai_server_node:
       occupancy_min_z: -100.0
       occupancy_max_z: 100.0
       occupancy_threshold: 0.50
-    
+
     sensor_model:
       max_range: 10.0
       hit: 0.7
@@ -18,7 +24,11 @@ bonxai_server_node:
       max: 0.97
 
     server:
+      # Seconds between automatic releaseUnusedMemory() passes.
+      # Set <= 0.0 to disable.
       cleanup_interval_sec: 300.0
+      # Seconds to block waiting for the sensor -> frame_id transform.
+      tf_timeout_sec: 0.1
 
     stats:
       enable_stats: true

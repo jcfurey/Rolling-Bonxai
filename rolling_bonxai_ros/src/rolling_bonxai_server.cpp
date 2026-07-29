@@ -1,6 +1,11 @@
 #include "rolling_bonxai_ros/rolling_bonxai_server.hpp"
 
-#include <tf2/exceptions.h>
+#include <tf2/exceptions.hpp>
+#include <tf2/time.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <utility>
 
 namespace
 {
@@ -26,7 +31,35 @@ RollingBonxaiServer::RollingBonxaiServer(
   initStatsPublishers();
   initChunkVisualization();
 
-  RCLCPP_INFO(get_logger(), "RollingBonxaiServer started");
+  // use_sim_time is pre-declared by rclcpp. Report it, because almost every
+  // "the map never updates" report against a simulated robot comes down to this
+  // being false while /clock is the only time source in the graph.
+  const bool use_sim_time = get_parameter("use_sim_time").as_bool();
+  RCLCPP_INFO(
+    get_logger(),
+    "RollingBonxaiServer started (use_sim_time=%s, clock=%s)",
+    use_sim_time ? "true" : "false",
+    use_sim_time ? "/clock" : "system");
+
+  if (use_sim_time) {
+    RCLCPP_INFO(
+      get_logger(),
+      "Simulated time is in use: timers and chunk ageing follow /clock, and "
+      "nothing will fire until /clock starts publishing.");
+  }
+}
+
+RollingBonxaiServer::~RollingBonxaiServer()
+{
+  // Chunks only reach disk when the policy evicts them, so without a flush the
+  // whole neighbourhood around the robot is lost on exit. ~RollingOccupancyMap
+  // would do this anyway; doing it here orders the flush ahead of the rest of
+  // the node's teardown, while the rclcpp::Logger the engine writes through is
+  // still plainly alive. flushAllChunks() is idempotent, so the second call
+  // from the engine's own destructor is a no-op.
+  if (occupancy_map_) {
+    occupancy_map_->flushAllChunks();
+  }
 }
 
 void RollingBonxaiServer::loadParameters()
@@ -37,6 +70,9 @@ void RollingBonxaiServer::loadParameters()
 
   server_params_.cleanup_interval_sec =
     declare_parameter<double>("server.cleanup_interval_sec", 300.0);
+
+  server_params_.tf_timeout_sec =
+    declare_parameter<double>("server.tf_timeout_sec", 0.1);
 
   server_params_.enable_stats =
     declare_parameter<bool>("stats.enable_stats", true);
@@ -49,6 +85,9 @@ void RollingBonxaiServer::loadParameters()
 
   server_params_.stats_publish_rate =
     declare_parameter<double>("stats.publish_rate", 1.0);
+
+  server_params_.chunk_vis_publish_rate =
+    declare_parameter<double>("stats.chunk_vis_publish_rate", 1.0);
 
   auto& mp = rolling_params_.map_params;
 
@@ -75,6 +114,12 @@ void RollingBonxaiServer::loadParameters()
   rolling_params_.nb_radius =
     declare_parameter<int>("rolling.loading_policy.neighborhood.radius", 2);
 
+  // planar.radius and temporal.radius were documented and shipped in the params
+  // file but never declared, so both policies silently ran at the neighbourhood
+  // radius no matter what the user configured.
+  rolling_params_.planar_radius =
+    declare_parameter<int>("rolling.loading_policy.planar.radius", 1);
+
   rolling_params_.planar_z_min =
     declare_parameter<int>("rolling.loading_policy.planar.z_min", 1);
 
@@ -83,6 +128,9 @@ void RollingBonxaiServer::loadParameters()
 
   rolling_params_.planar_use_relative =
     declare_parameter<bool>("rolling.loading_policy.planar.use_relative", false);
+
+  rolling_params_.temporal_radius =
+    declare_parameter<int>("rolling.loading_policy.temporal.radius", 2);
 
   rolling_params_.temporal_age_weightage =
     declare_parameter<double>("rolling.loading_policy.temporal.age_weightage", 0.3);
@@ -93,13 +141,27 @@ void RollingBonxaiServer::loadParameters()
   rolling_params_.full_save_folder_path =
     declare_parameter<std::string>("rolling.storage.full_save_folder_path", "");
 
-  rolling_params_.asyncio.enable_io = declare_parameter<bool>("rolling.asyncio.enable_io",true);
-  
-  rolling_params_.asyncio.num_load_threads =
-    static_cast<size_t>(declare_parameter<int>("rolling.asyncio.num_load_threads", 3));
+  rolling_params_.asyncio.enable_io = declare_parameter<bool>("rolling.asyncio.enable_io", false);
 
-  rolling_params_.asyncio.num_save_threads =
-    static_cast<size_t>(declare_parameter<int>("rolling.asyncio.num_save_threads", 1));
+  // declare_parameter<int> yields int64_t; clamp to >= 1 because a pool of zero
+  // worker threads would leave every queued load or save permanently unserviced.
+  rolling_params_.asyncio.num_load_threads = static_cast<size_t>(
+    std::max<int64_t>(1, declare_parameter<int>("rolling.asyncio.num_load_threads", 3)));
+
+  rolling_params_.asyncio.num_save_threads = static_cast<size_t>(
+    std::max<int64_t>(1, declare_parameter<int>("rolling.asyncio.num_save_threads", 1)));
+
+  // Enabling disk I/O without a destination silently writes nowhere, so treat
+  // the empty path as "memory only" and say so.
+  if (rolling_params_.asyncio.enable_io &&
+      rolling_params_.full_save_folder_path.empty())
+  {
+    RCLCPP_ERROR(
+      get_logger(),
+      "rolling.asyncio.enable_io is true but rolling.storage.full_save_folder_path "
+      "is empty. Disabling disk I/O — set a writable path to enable chunk persistence.");
+    rolling_params_.asyncio.enable_io = false;
+  }
 }
 
 void RollingBonxaiServer::initLogger()
@@ -110,13 +172,27 @@ void RollingBonxaiServer::initLogger()
 void RollingBonxaiServer::initTF()
 {
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+
+  // Give the buffer a ROS-time timer factory. Without it, any timeout-based
+  // wait inside tf2 falls back to a steady-clock wait, which does not line up
+  // with the sim-time stamps on incoming transforms.
+  auto timer_interface = std::make_shared<tf2_ros::CreateTimerROS>(
+    get_node_base_interface(), get_node_timers_interface());
+  tf_buffer_->setCreateTimerInterface(timer_interface);
+
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 }
 
 void RollingBonxaiServer::initMap()
 {
+  // Hand the node clock to the engine so chunk ageing is measured in the same
+  // time domain the rest of the graph uses. Under use_sim_time this is /clock,
+  // so temporal.max_age_s means simulated seconds rather than wall seconds.
   occupancy_map_ =
-    std::make_unique<RollingBonxai::RollingOccupancyMap>(rolling_params_, logger_);
+    std::make_unique<RollingBonxai::RollingOccupancyMap>(
+      rolling_params_,
+      logger_,
+      [this]() -> int64_t { return this->now().nanoseconds(); });
 }
 
 void RollingBonxaiServer::initSubscriber()
@@ -138,7 +214,35 @@ void RollingBonxaiServer::initService()
         this,
         std::placeholders::_1,
         std::placeholders::_2));
+
+  if (server_params_.cleanup_interval_sec > 0.0) {
+    cleanup_timer_ = createRosTimer(
+      1.0 / server_params_.cleanup_interval_sec,
+      std::bind(&RollingBonxaiServer::cleanupTimerCallback, this));
+    RCLCPP_INFO(
+      get_logger(), "Periodic memory cleanup enabled: every %.1fs",
+      server_params_.cleanup_interval_sec);
   }
+}
+
+rclcpp::TimerBase::SharedPtr RollingBonxaiServer::createRosTimer(
+  double rate_hz, std::function<void()> callback)
+{
+  // A non-positive rate yields an infinite or negative period. Both make
+  // rclcpp throw, so clamp and report instead of taking the node down.
+  if (!(rate_hz > 0.0)) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Requested timer rate %.3f Hz is not positive; falling back to 1.0 Hz",
+      rate_hz);
+    rate_hz = 1.0;
+  }
+
+  const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::duration<double>(1.0 / rate_hz));
+
+  return rclcpp::create_timer(this, get_clock(), rclcpp::Duration(period), std::move(callback));
+}
 
 void RollingBonxaiServer::initStatsPublishers()
 {
@@ -158,13 +262,12 @@ void RollingBonxaiServer::initStatsPublishers()
 
   quick_occ_stats_pub_ =
     create_publisher<rolling_bonxai_msgs::msg::QuickOccupancyStats>(
-      "/rolling_bonxai/quick_occupancy_stats", 10);
+      
+        "/rolling_bonxai/quick_occupancy_stats", 10);
 
-  const auto period =
-    std::chrono::duration<double>(1.0 / server_params_.stats_publish_rate);
-
-  stats_timer_ =
-    create_wall_timer(period, std::bind(&RollingBonxaiServer::publishStats, this));
+  stats_timer_ = createRosTimer(
+    server_params_.stats_publish_rate,
+    std::bind(&RollingBonxaiServer::publishStats, this));
 }
 
 void RollingBonxaiServer::initChunkVisualization()
@@ -175,10 +278,9 @@ void RollingBonxaiServer::initChunkVisualization()
   transition_state_pub_ =
     create_publisher<rolling_bonxai_msgs::msg::RollingState>("/rolling_bonxai/transition_state", 10);
 
-  chunk_vis_timer_ =
-    create_wall_timer(
-      std::chrono::seconds(1),
-      std::bind(&RollingBonxaiServer::publishChunkVisualization, this));
+  chunk_vis_timer_ = createRosTimer(
+    server_params_.chunk_vis_publish_rate,
+    std::bind(&RollingBonxaiServer::publishChunkVisualization, this));
 }
 
 void RollingBonxaiServer::cleanMemoryServiceCallback(
@@ -198,6 +300,24 @@ void RollingBonxaiServer::cleanMemoryServiceCallback(
   response->message = "RollingBonxai memory cleanup completed";
 }
 
+void RollingBonxaiServer::cleanupTimerCallback()
+{
+  if (!occupancy_map_ || !occupancy_map_->isStatsStable()) {
+    // Chunk I/O is in flight; try again next cycle rather than touching grids
+    // that a worker thread may be serialising.
+    return;
+  }
+
+  const size_t before = occupancy_map_->getMemoryUsage();
+  occupancy_map_->releaseUnusedMemory();
+  occupancy_map_->shrinkToFit();
+  const size_t after = occupancy_map_->getMemoryUsage();
+
+  RCLCPP_INFO(
+    get_logger(), "Periodic cleanup: %.1f MiB -> %.1f MiB (freed %.1f MiB)",
+    bytesToMiB(before), bytesToMiB(after),
+    bytesToMiB(before) - bytesToMiB(after));
+}
 
 void RollingBonxaiServer::publishStats()
 {
@@ -213,9 +333,9 @@ void RollingBonxaiServer::publishStats()
 
       for (const auto& p : points) {
         pcl::PointXYZRGB pt;
-        pt.x = p.x();
-        pt.y = p.y();
-        pt.z = p.z();
+        pt.x = static_cast<float>(p.x());
+        pt.y = static_cast<float>(p.y());
+        pt.z = static_cast<float>(p.z());
         pt.r = 255;
         pt.g = 0;
         pt.b = 0;
@@ -238,7 +358,9 @@ void RollingBonxaiServer::publishStats()
   cs.clean_chunk_count = occupancy_map_->getCleanChunkCount();
   chunk_stats_pub_->publish(cs);
 
-  const auto qs = occupancy_map_->getStats(false);
+  // stats.quick_stats was declared but ignored, so the expensive full-cell
+  // iteration could never actually be requested. Honour it now.
+  const auto qs = occupancy_map_->getStats(!server_params_.quick_stats);
   rolling_bonxai_msgs::msg::QuickOccupancyStats qs_msg;
   qs_msg.header.stamp = now_time;
   qs_msg.header.frame_id = server_params_.frame_id;
@@ -315,6 +437,20 @@ void RollingBonxaiServer::publishChunkVisualization()
     arr.markers.push_back(m);
   }
 
+  // Markers persist in RViz until explicitly removed. Once the rolling window
+  // shrinks, every id we published last cycle but not this one would otherwise
+  // stay on screen forever as a ghost chunk.
+  for (int stale_id = id; stale_id < last_marker_count_; ++stale_id) {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = server_params_.frame_id;
+    m.header.stamp = now_time;
+    m.ns = "chunks";
+    m.id = stale_id;
+    m.action = visualization_msgs::msg::Marker::DELETE;
+    arr.markers.push_back(m);
+  }
+  last_marker_count_ = id;
+
   chunk_marker_pub_->publish(arr);
 
   rolling_bonxai_msgs::msg::RollingState ts;
@@ -325,17 +461,31 @@ void RollingBonxaiServer::publishChunkVisualization()
 }
 
 void RollingBonxaiServer::pointcloudCallback(
-  const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+  const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
 {
+  // An all-zero stamp means the publisher never filled the header. Asking tf2
+  // for transform-at-time-zero is interpreted as "the latest available", which
+  // is the only sensible reading; looking up an actual epoch-zero timestamp
+  // would fail on every cloud.
+  const rclcpp::Time stamp(msg->header.stamp);
+  const tf2::TimePoint lookup_time =
+    (stamp.nanoseconds() == 0)
+      ? tf2::TimePointZero
+      : tf2::TimePoint(std::chrono::nanoseconds(stamp.nanoseconds()));
+
   geometry_msgs::msg::TransformStamped tf;
   try {
     tf = tf_buffer_->lookupTransform(
       server_params_.frame_id,
       msg->header.frame_id,
-      msg->header.stamp,
-      rclcpp::Duration::from_seconds(0.1));
-  } catch (tf2::TransformException& ex) {
-    RCLCPP_WARN(get_logger(), "TF failed: %s", ex.what());
+      lookup_time,
+      tf2::durationFromSec(server_params_.tf_timeout_sec));
+  } catch (const tf2::TransformException& ex) {
+    // Throttled: on a mis-configured frame this fires at full sensor rate.
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "TF lookup %s -> %s failed: %s",
+      msg->header.frame_id.c_str(), server_params_.frame_id.c_str(), ex.what());
     return;
   }
 
@@ -348,7 +498,7 @@ void RollingBonxaiServer::pointcloudCallback(
     tf.transform.translation.y,
     tf.transform.translation.z);
 
-  Eigen::Vector3d linvel(0.0,0.0,0.0);
+  Eigen::Vector3d linvel(0.0, 0.0, 0.0);
 
   Eigen::Quaterniond q(
     tf.transform.rotation.w,

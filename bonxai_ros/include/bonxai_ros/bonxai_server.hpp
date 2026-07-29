@@ -9,8 +9,12 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
-#include <tf2_ros/transform_listener.h>
-#include <tf2_ros/buffer.h>
+// tf2 headers were renamed to .hpp in Jazzy; the legacy .h spellings are
+// deprecation shims that are removed in later distros. Use .hpp so the same
+// source builds on Jazzy and Lyrical.
+#include <tf2_ros/transform_listener.hpp>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/create_timer_ros.hpp>
 #include <tf2_eigen/tf2_eigen.hpp>
 
 // PCL
@@ -19,7 +23,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 
 // Eigen
-#include <eigen3/Eigen/Geometry>
+#include <Eigen/Geometry>
 
 // Bonxai
 #include "bonxai_map/occupancy_map.hpp"
@@ -51,7 +55,10 @@ struct BonxaiParams
   
   // Cleanup
   double cleanup_interval_sec{300.0};  // 5 minutes
-  
+
+  /// How long to block waiting for the sensor->map transform, in seconds
+  double tf_timeout_sec{0.1};
+
   // Stats
   bool enable_stats{true};
   bool quick_stats{true};
@@ -76,8 +83,22 @@ private:
   void init_timers();
 
   // Callbacks
-  void pointcloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
-  
+  void pointcloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+
+  /**
+   * @brief Create a timer driven by the node clock
+   *
+   * Deliberately not create_wall_timer(): wall timers run off the steady clock
+   * and ignore /clock, so under use_sim_time they would fire at wall rate while
+   * everything else in the graph follows simulated time.
+   *
+   * @param rate_hz Firing rate in Hz (must be > 0)
+   * @param callback Callback to invoke
+   */
+  rclcpp::TimerBase::SharedPtr create_ros_timer(
+    double rate_hz, std::function<void()> callback);
+
+
   // Service handlers
   void handle_get_occupied_voxels(
     const std::shared_ptr<bonxai_msgs::srv::GetOccupiedVoxels::Request> request,

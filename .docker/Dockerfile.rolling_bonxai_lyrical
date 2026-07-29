@@ -1,0 +1,95 @@
+# ============================================================
+# .docker/Dockerfile.rolling_bonxai_lyrical
+#
+# ROS 2 Lyrical Luth (Ubuntu 26.04 Resolute) build of Rolling Bonxai.
+#
+# Rolling Bonxai supports Jazzy and Lyrical. Use this image to check the
+# newer of the two; .docker/Dockerfile.rolling_bonxai_jazzy is the Jazzy
+# equivalent. DDS (Fast-DDS / CycloneDDS) is wire-compatible across
+# distros on the same ROS_DOMAIN_ID, so topics cross the distro boundary
+# transparently on network_mode: host.
+#
+# Two-stage build (same pattern as the Jazzy Dockerfile):
+#   deps  — all apt deps, no source  (devcontainer uses this)
+#   build — colcon build             (compose uses this)
+#
+# Build from repo root:
+#   docker build -f .docker/Dockerfile.rolling_bonxai_lyrical \
+#                --target build -t rolling_bonxai:lyrical .
+# ============================================================
+
+# ── Stage 1: deps ────────────────────────────────────────────
+FROM ros:lyrical-ros-base AS deps
+
+SHELL ["/bin/bash", "-o", "pipefail", "-o", "errexit", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Gazebo is available directly from the standard ROS apt repository on
+# recent Ubuntu releases — no separate OSRF key needed.
+# ros-lyrical-ros-gz-bridge pulls Gazebo automatically.
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build tools
+    build-essential \
+    cmake \
+    git \
+    wget \
+    python3-colcon-common-extensions \
+    python3-rosdep \
+    python3-pip \
+    # ROS 2 Lyrical packages needed by rolling_bonxai_ros
+    ros-lyrical-ament-cmake-auto \
+    ros-lyrical-tf2-ros \
+    ros-lyrical-tf2-eigen \
+    ros-lyrical-sensor-msgs \
+    ros-lyrical-geometry-msgs \
+    ros-lyrical-visualization-msgs \
+    ros-lyrical-pcl-conversions \
+    ros-lyrical-std-srvs \
+    ros-lyrical-rclcpp-components \
+    ros-lyrical-foxglove-bridge \
+    # Gazebo bridge (for /clock topic relay from SITL)
+    ros-lyrical-ros-gz-bridge \
+    # C++ dependencies
+    libeigen3-dev \
+    libpcl-dev \
+    libyaml-cpp-dev \
+    libboost-all-dev \
+    # Debug tools
+    gdb \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rosdep init 2>/dev/null || true && rosdep update
+
+RUN echo "source /opt/ros/lyrical/setup.bash" >> /root/.bashrc && \
+    echo "source /usr/share/colcon_argcomplete/hook/colcon-argcomplete.bash" \
+         >> /root/.bashrc
+
+# ── Stage 2: build ───────────────────────────────────────────
+FROM deps AS build
+
+# Workspace root — the entire repo is copied into src/Rolling-Bonxai/
+WORKDIR /ros2_ws
+
+COPY . src/Rolling-Bonxai/
+
+# Resolve rosdep dependencies (skip packages without apt binaries)
+RUN source /opt/ros/lyrical/setup.bash && \
+    rosdep install \
+        --from-paths src \
+        --ignore-src \
+        --rosdistro lyrical \
+        -y \
+        --skip-keys "libpcl-all-dev" \
+    || true
+
+# Full release build
+RUN source /opt/ros/lyrical/setup.bash && \
+    colcon build \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release \
+        --event-handlers console_cohesion+
+
+RUN echo "source /ros2_ws/install/setup.bash" >> /root/.bashrc
+
+WORKDIR /ros2_ws
+CMD ["bash"]

@@ -1,14 +1,16 @@
 #pragma once
 
-#include <future>
-#include <functional>
-#include <memory>
-#include <optional>
-#include <thread>
-#include <vector>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "rolling_bonxai/common.hpp"
 #include "rolling_bonxai/task_queue.hpp"
@@ -124,10 +126,10 @@ public:
 
     /**
      * @brief Destructor - performs graceful shutdown
-     * 
-     * Shuts down both queues, joins all worker threads.
-     * Does NOT wait for pending saves — call waitForPendingSaves() before
-     * destruction if you need to ensure all data is flushed.
+     *
+     * Drains queued and in-flight saves (bounded by config.shutdown_timeout),
+     * then shuts down both queues and joins all worker threads. Queued loads
+     * are abandoned, which is harmless — an unfinished load has no data to lose.
      */
     ~AsyncChunkManager();
 

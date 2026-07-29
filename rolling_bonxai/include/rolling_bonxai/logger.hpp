@@ -1,7 +1,9 @@
 #pragma once
 
-#include <string>
+#include <cstdio>
 #include <memory>
+#include <stdexcept>
+#include <string>
 
 namespace RollingBonxai
 {

@@ -3,11 +3,12 @@
 <package format="3">
   <name>bonxai_map</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Probabilistic log-odds occupancy map built on the Bonxai sparse voxel grid</description>
   <maintainer email="mukund199823@gmail.com">mukund</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
 
   <depend>bonxai_core</depend>
   <depend>eigen</depend>
@@ -19,5 +20,5 @@
   <export>
     <build_type>ament_cmake</build_type>
   </export>
-  
+
 </package>

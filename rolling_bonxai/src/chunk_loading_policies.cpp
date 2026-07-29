@@ -78,6 +78,11 @@ int NeighborhoodPolicy::getRadius() const
     return radius_;
 }
 
+int NeighborhoodPolicy::getSearchRadius() const
+{
+    return radius_;
+}
+
 // ============================================================================
 // PlanarNeighborhoodPolicy Implementation
 // ============================================================================
@@ -183,6 +188,19 @@ std::string PlanarNeighborhoodPolicy::getDescription() const
 
 int PlanarNeighborhoodPolicy::getRadius() const
 {
+    return radius_;
+}
+
+int PlanarNeighborhoodPolicy::getSearchRadius() const
+{
+    // Relative mode measures z_min/z_max as offsets below/above the ego, so both
+    // are vertical extents that the enumeration cube has to cover. In absolute
+    // mode they are world chunk coordinates instead, and the vertical reach is
+    // then bounded by the horizontal radius (shouldLoad() still applies the
+    // Chebyshev test), so only the relative case can widen the cube.
+    if (use_relative_) {
+        return std::max({radius_, z_min_, z_max_});
+    }
     return radius_;
 }
 
@@ -311,6 +329,11 @@ std::string TemporalNeighborhoodPolicy::getDescription() const
 }
 
 int TemporalNeighborhoodPolicy::getRadius() const
+{
+    return radius_;
+}
+
+int TemporalNeighborhoodPolicy::getSearchRadius() const
 {
     return radius_;
 }

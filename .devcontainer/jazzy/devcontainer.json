@@ -1,13 +1,14 @@
 {
     // Rolling Bonxai dev container — ROS 2 Jazzy (Ubuntu 24.04 Noble)
     //
-    // Use this when you want to develop on Jazzy. The SITL container
-    // (roscon-25-workshop) runs Humble, but Fast-DDS is wire-compatible
-    // across distros on the same ROS_DOMAIN_ID, so all /fmu/* and
-    // /depth_camera/* topics are visible from both distros.
+    // Rolling Bonxai supports Jazzy and Lyrical. This is the older of the
+    // two; .devcontainer/lyrical is the Lyrical equivalent. Fast-DDS is
+    // wire-compatible across distros on the same ROS_DOMAIN_ID, so all
+    // /fmu/* and /depth_camera/* topics are visible from both distros
+    // regardless of which one the SITL container runs.
     //
     // Named volumes use a _jazzy suffix to avoid colliding with the
-    // Humble devcontainer if both are ever open simultaneously.
+    // Lyrical devcontainer if both are ever open simultaneously.
     //
     // To open: CTRL+SHIFT+P → "Dev Containers: Reopen in Container"
     //           → select "rolling_bonxai_jazzy"

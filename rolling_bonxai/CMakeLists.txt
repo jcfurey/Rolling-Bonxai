@@ -1,11 +1,13 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.16)
 project(rolling_bonxai)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -13,17 +15,30 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Find dependencies
 # ============================================================================
 
-find_package(ament_cmake REQUIRED)
-find_package(bonxai_core REQUIRED)
-find_package(bonxai_map REQUIRED)
+find_package(ament_cmake_auto REQUIRED)
+ament_auto_find_build_dependencies()
+
+# Neither Eigen nor yaml-cpp ships an ament package, so
+# ament_auto_find_build_dependencies() skips their rosdep keys. Find them here.
 find_package(Eigen3 REQUIRED)
 find_package(yaml-cpp REQUIRED)
+
+# AsyncChunkManager spawns std::thread workers.
+find_package(Threads REQUIRED)
+
+# yaml-cpp 0.8 (Ubuntu 24.04) exports yaml-cpp::yaml-cpp; older releases only
+# defined the unnamespaced `yaml-cpp` target. Normalise to one name.
+if(TARGET yaml-cpp::yaml-cpp)
+  set(YAML_CPP_TARGET yaml-cpp::yaml-cpp)
+else()
+  set(YAML_CPP_TARGET yaml-cpp)
+endif()
 
 # ============================================================================
 # Create the library
 # ============================================================================
 
-add_library(${PROJECT_NAME} SHARED
+ament_auto_add_library(${PROJECT_NAME} SHARED
   src/common.cpp
   src/coordinate_system.cpp
   src/chunk_storage.cpp
@@ -34,223 +49,42 @@ add_library(${PROJECT_NAME} SHARED
   src/rolling_occupancy_map.cpp
 )
 
-# Set C++17 standard
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 
-# Include directories
-target_include_directories(${PROJECT_NAME}
-  PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-    ${EIGEN3_INCLUDE_DIRS}
-)
-
-# Link against bonxai_core and bonxai_map (header-only)
+# Plain signature: ament_auto_add_library() already calls
+# ament_target_dependencies(), which links with the plain signature, and CMake
+# forbids mixing the two forms on one target.
 target_link_libraries(${PROJECT_NAME}
-  PUBLIC
-    bonxai_core::bonxai_core
-    bonxai_map::bonxai_map
-    yaml-cpp
+  Eigen3::Eigen
+  ${YAML_CPP_TARGET}
+  Threads::Threads
 )
 
-# Export dependencies for downstream packages
-ament_target_dependencies(${PROJECT_NAME}
-  PUBLIC
-    Eigen3
-)
-
-# ============================================================================
-# Install library
-# ============================================================================
-
-install(
-  TARGETS ${PROJECT_NAME}
-  EXPORT ${PROJECT_NAME}Targets
-  ARCHIVE DESTINATION lib
-  LIBRARY DESTINATION lib
-  RUNTIME DESTINATION bin
-  INCLUDES DESTINATION include
-)
-
-# Install header files
-install(
-  DIRECTORY include/
-  DESTINATION include
-)
-
-# Export targets
-ament_export_targets(${PROJECT_NAME}Targets HAS_LIBRARY_TARGET)
-
-# Export dependencies
-ament_export_dependencies(
-  bonxai_core
-  bonxai_map
-  Eigen3
-)
-
-# Export include directories
-ament_export_include_directories(include)
+ament_export_dependencies(Eigen3 yaml-cpp)
 
 # ============================================================================
 # Testing
 # ============================================================================
 
 if(BUILD_TESTING)
-  # turn off linting because our codestyle is fucked
-  # find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  set(ament_cmake_copyright_FOUND TRUE)
-  set(ament_cmake_cpplint_FOUND TRUE)
-  # ament_lint_auto_find_test_dependencies()
   find_package(ament_cmake_gtest REQUIRED)
-  find_package(bonxai_core REQUIRED)
-  find_package(bonxai_map REQUIRED)
 
-  add_library(${PROJECT_NAME}_testlib STATIC
-    src/common.cpp
-    src/coordinate_system.cpp
-    src/chunk_storage.cpp
-    src/transition_manager.cpp
-    src/chunk_loading_policies.cpp
-    src/file_storage_backend.cpp
-    src/rolling_occupancy_map.cpp
+  # Each test links the shared library directly; the previous duplicate static
+  # "testlib" compiled the same sources a second time and drifted out of sync
+  # with the real target's source list.
+  set(${PROJECT_NAME}_TESTS
+    test_common
+    test_coordinate_system
+    test_file_storage_backend
+    test_chunk_storage
+    test_chunk_loading_policy
+    test_transition_manager
   )
 
-  target_include_directories(${PROJECT_NAME}_testlib PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-  )
-
-  target_link_libraries(${PROJECT_NAME}_testlib PUBLIC
-    bonxai_core::bonxai_core
-    bonxai_map::bonxai_map
-    yaml-cpp
-  )
-
-  ament_target_dependencies(${PROJECT_NAME}_testlib PUBLIC
-    Eigen3
-  )
-
-  ## Common tests
-  ament_add_gtest(test_common
-    test/test_common.cpp
-  )
-
-  target_include_directories(test_common PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-  )
-
-  target_link_libraries(test_common
-    ${PROJECT_NAME}_testlib  # Link against the static library
-  )
-
-  ament_target_dependencies(test_common
-    Eigen3
-    bonxai_core
-    bonxai_map
-  )
-
-  ## Coordinate System tests
-  ament_add_gtest(test_coordinate_system
-    test/test_coordinate_system.cpp
-  )
-
-  target_include_directories(test_coordinate_system PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-  )
-
-  target_link_libraries(test_coordinate_system
-    ${PROJECT_NAME}_testlib  # Link against the static library
-  )
-
-  ament_target_dependencies(test_coordinate_system
-    Eigen3
-    bonxai_core
-    bonxai_map
-  )
-
-    ## File Storage Backend tests
-  ament_add_gtest(test_file_storage_backend
-    test/test_file_storage_backend.cpp
-  )
-
-  target_include_directories(test_file_storage_backend PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-  )
-
-  target_link_libraries(test_file_storage_backend
-    ${PROJECT_NAME}_testlib  # Link against the static library
-  )
-
-  ament_target_dependencies(test_file_storage_backend
-    Eigen3
-    bonxai_core
-    bonxai_map
-  )
-
-  ## Chunk Storage tests
-  ament_add_gtest(test_chunk_storage
-    test/test_chunk_storage.cpp
-  )
-
-  target_include_directories(test_chunk_storage PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-  )
-
-  target_link_libraries(test_chunk_storage
-    ${PROJECT_NAME}_testlib  # Link against the static library
-  )
-
-  ament_target_dependencies(test_chunk_storage
-    Eigen3
-    bonxai_core
-    bonxai_map
-  )
-
-  ## Chunk Loading Policy
-  ament_add_gtest(test_chunk_loading_policy
-    test/test_chunk_loading_policy.cpp
-  )
-
-  target_include_directories(test_chunk_loading_policy PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-  )
-
-  target_link_libraries(test_chunk_loading_policy
-    ${PROJECT_NAME}_testlib  # Link against the static library
-  )
-
-  ament_target_dependencies(test_chunk_loading_policy
-    Eigen3
-    bonxai_core
-    bonxai_map
-  )
-
-  ## Transition manager tests
-  ament_add_gtest(test_transition_manager
-    test/test_transition_manager.cpp
-  )
-
-  target_include_directories(test_transition_manager PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-  )
-
-  target_link_libraries(test_transition_manager
-    ${PROJECT_NAME}_testlib  # Link against the static library
-  )
-
-  ament_target_dependencies(test_transition_manager
-    Eigen3
-    bonxai_core
-    bonxai_map
-  )
-
+  foreach(_test ${${PROJECT_NAME}_TESTS})
+    ament_add_gtest(${_test} test/${_test}.cpp)
+    target_link_libraries(${_test} ${PROJECT_NAME})
+  endforeach()
 endif()
 
 # ============================================================================
@@ -270,4 +104,7 @@ endif()
 # Package
 # ============================================================================
 
-ament_package()
+# USE_SCOPED_HEADER_INSTALL_DIR installs headers into include/${PROJECT_NAME},
+# which is the ament_auto default from Kilted onwards. Passing it explicitly
+# keeps the installed layout identical on Jazzy and Lyrical.
+ament_auto_package(USE_SCOPED_HEADER_INSTALL_DIR)
