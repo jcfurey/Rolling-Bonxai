@@ -27,8 +27,17 @@ AsyncChunkManager::AsyncChunkManager(
     }
 }
 
-AsyncChunkManager::~AsyncChunkManager() 
+AsyncChunkManager::~AsyncChunkManager()
 {
+    // Drain queued saves BEFORE anything is torn down. Setting stop_ or shutting
+    // the save queue down first would discard every dirty chunk still waiting to
+    // be written, silently losing map data on every clean exit.
+    if (!waitForPendingSaves()) {
+        std::cerr << "[AsyncChunkManager] Destructor: pending saves did not drain "
+                     "within the shutdown timeout; some chunks may be lost"
+                  << std::endl;
+    }
+
     // Signal all workers to stop
     stop_.store(true);
 
@@ -149,6 +158,12 @@ AsyncChunkManager::saveAsync(const ChunkCoord& coord,
 
 bool AsyncChunkManager::waitForPendingSaves()
 {
+    // Nothing to drain, and no worker to notify us — return before waiting so a
+    // manager with num_save_threads == 0 (or one that never saved) exits at once.
+    if (save_queue_.empty() && inflight_saves_.load(std::memory_order_acquire) == 0) {
+        return true;
+    }
+
     std::unique_lock<std::mutex> lock(saves_done_mutex_);
 
     // wait until the save queue is empty and inflight saves are all done. or timeout first
@@ -210,42 +225,47 @@ void AsyncChunkManager::loadWorkerLoop()
 
         LoadRequest& request = request_opt.value();
 
-        std::unique_ptr<Bonxai::VoxelGrid<Bonxai::Occupancy::CellOcc>> grid_ptr {nullptr};
-        if (config_.enable_io) {
-            try {
+        // Every path out of this block must leave the promise satisfied exactly
+        // once and must not let an exception escape: an uncaught throw on a
+        // worker thread terminates the process, and a second set_value() on an
+        // already-satisfied promise throws std::future_error.
+        try {
+            std::unique_ptr<Bonxai::VoxelGrid<Bonxai::Occupancy::CellOcc>> grid_ptr{nullptr};
+            if (config_.enable_io) {
                 grid_ptr = backend_->load(request.coord);
-            } 
-            catch (const std::exception& e) {
-                // Load failed — propagate exception through promise
-                try {
-                    request.promise->set_exception(std::current_exception());
-                } catch (...) {/*Promise already satisfied (shouldn't happen, but be defensive)*/}
-                stats_.loads_failed.fetch_add(1, std::memory_order_relaxed);
-
-                std::ostringstream oss;
-                oss << "[AsyncChunkManager] Load failed for coord ("
-                    << request.coord.x << ", " << request.coord.y << ", " << request.coord.z 
-                    << "): " << e.what();
-                std::cerr << oss.str() << std::endl;
             }
-        }
-        
-        // result to store
-        std::unique_ptr<Bonxai::OccupancyMap> result;
-        if (grid_ptr) {
-            // Chunk existed on disk — construct OccupancyMap from deserialized VoxelGrid
-            auto options = request.options_factory();
-            result = std::make_unique<Bonxai::OccupancyMap>(
-                options, std::move(*grid_ptr)
-            );
-        }
-        else {
-            result = request.map_factory();
-        }
 
-        // Fulfill promise
-        request.promise->set_value(std::move(result));
-        stats_.loads_completed.fetch_add(1, std::memory_order_relaxed);
+            // result to store
+            std::unique_ptr<Bonxai::OccupancyMap> result;
+            if (grid_ptr) {
+                // Chunk existed on disk — construct OccupancyMap from deserialized VoxelGrid
+                auto options = request.options_factory();
+                result = std::make_unique<Bonxai::OccupancyMap>(
+                    options, std::move(*grid_ptr)
+                );
+            }
+            else {
+                result = request.map_factory();
+            }
+
+            // Fulfill promise
+            request.promise->set_value(std::move(result));
+            stats_.loads_completed.fetch_add(1, std::memory_order_relaxed);
+        }
+        catch (const std::exception& e) {
+            // Propagate the failure to the caller through the promise so that
+            // pollPendingLoads() reports it instead of blocking forever.
+            try {
+                request.promise->set_exception(std::current_exception());
+            } catch (...) {/*Promise already satisfied (shouldn't happen, but be defensive)*/}
+            stats_.loads_failed.fetch_add(1, std::memory_order_relaxed);
+
+            std::ostringstream oss;
+            oss << "[AsyncChunkManager] Load failed for coord ("
+                << request.coord.x << ", " << request.coord.y << ", " << request.coord.z
+                << "): " << e.what();
+            std::cerr << oss.str() << std::endl;
+        }
 
         // Remove from pending_loads_ regardless of success/failure
         removePendingLoad(request.coord);
@@ -294,8 +314,15 @@ void AsyncChunkManager::saveWorkerLoop()
             std::cerr << oss.str() << std::endl;
         }
 
-        // Decrement in-flight counter and notify waitForPendingSaves
-        inflight_saves_.fetch_sub(1, std::memory_order_acq_rel);
+        // Decrement in-flight counter and notify waitForPendingSaves.
+        // The decrement has to happen under saves_done_mutex_: waitForPendingSaves
+        // evaluates its predicate while holding that lock, so decrementing outside
+        // it lets the last save land between the predicate check and the wait,
+        // costing a full shutdown_timeout of dead time on every clean exit.
+        {
+            std::lock_guard<std::mutex> lock(saves_done_mutex_);
+            inflight_saves_.fetch_sub(1, std::memory_order_acq_rel);
+        }
         saves_done_cv_.notify_all();
     }
 }

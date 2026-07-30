@@ -19,21 +19,30 @@ Full Video Here: https://youtu.be/h4DjMLnnrf4
 
 1. [Prerequisites](#prerequisites)
 2. [Launching Rolling Bonxai](#launching-rolling-bonxai)
-3. [Parameter Reference](#parameter-reference)
-4. [Architecture Overview](#architecture-overview)
-5. [Data Flow Diagram](#data-flow-diagram)
+3. [Simulated Time](#simulated-time)
+4. [Parameter Reference](#parameter-reference)
+5. [Architecture Overview](#architecture-overview)
+6. [Data Flow Diagram](#data-flow-diagram)
 
 ---
 
 ## Prerequisites
+
+**Supported ROS 2 distributions: Jazzy Jalisco and Lyrical Luth.**
 
 Rolling Bonxai requires a **point cloud source** published as a `sensor_msgs/PointCloud2` topic in the ROS 2 graph. This is typically provided by a depth camera (e.g., ZED2i) or a LiDAR sensor. You must configure `topic_in` to match the topic your sensor is publishing on, and ensure TF transforms are available from your sensor frame to the `frame_id` (map frame).
 
 **Required ROS 2 packages and dependencies:**
 
 - `bonxai_core`, `bonxai_map`, `rolling_bonxai`, `rolling_bonxai_msgs`
-- `rclcpp`, `sensor_msgs`, `tf2_ros`, `pcl_conversions`
-- `yaml-cpp`
+- `rclcpp`, `rclcpp_components`, `sensor_msgs`, `std_srvs`, `visualization_msgs`, `tf2`, `tf2_ros`, `tf2_eigen`, `pcl_conversions`
+- `eigen`, `libpcl-all-dev`, `yaml-cpp`
+
+All of these are declared in each package's `package.xml`, so the easiest way to install them is:
+
+```bash
+rosdep install --from-paths src --ignore-src -y --rosdistro "$ROS_DISTRO"
+```
 
 Build your workspace with:
 
@@ -41,6 +50,18 @@ Build your workspace with:
 colcon build --packages-select bonxai_core bonxai_map rolling_bonxai rolling_bonxai_msgs rolling_bonxai_ros
 source install/setup.bash
 ```
+
+### A note on the build system
+
+Every package uses **`ament_cmake_auto`**. Build dependencies come from `package.xml` rather than being repeated in CMake, so adding a ROS dependency means editing `package.xml` only.
+
+Two dependencies are still found explicitly in `CMakeLists.txt`, because they ship no ament package and `ament_auto_find_build_dependencies()` therefore skips them:
+
+- **Eigen** (rosdep key `eigen`) → `find_package(Eigen3 REQUIRED)`, linked as `Eigen3::Eigen`
+- **PCL** (rosdep key `libpcl-all-dev`) → `find_package(PCL REQUIRED COMPONENTS common io)`
+- **yaml-cpp** in `rolling_bonxai` → `find_package(yaml-cpp REQUIRED)`
+
+Headers install to `include/<package_name>/`, matching the `ament_auto_package` default from Kilted onwards; the `USE_SCOPED_HEADER_INSTALL_DIR` flag makes Jazzy do the same, so the installed layout is identical on both supported distributions.
 
 ---
 
@@ -54,18 +75,27 @@ The composable node option runs `RollingBonxaiServer` inside an `rclcpp_componen
 ros2 launch rolling_bonxai_ros rolling_bonxai_mapping.launch.py
 ```
 
-You can override the container name and Foxglove visualization port:
+The launch file accepts the following arguments:
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `container_name` | `rolling_bonxai_container` | Name of the `rclcpp_components` container |
+| `use_sim_time` | `false` | Drive timers and chunk ageing from `/clock`. Overrides the params file. |
+| `params_file` | `<share>/params/rolling_bonxai_params.yaml` | Full path to the parameters file |
+| `launch_foxglove` | `true` | Start a Foxglove Bridge alongside the server |
+| `foxglove_port` | `8765` | Foxglove Bridge WebSocket port |
 
 ```bash
 ros2 launch rolling_bonxai_ros rolling_bonxai_mapping.launch.py \
   container_name:=my_container \
-  foxglove_port:=8765
+  use_sim_time:=true \
+  params_file:=/path/to/my_params.yaml
 ```
 
 The launch file will:
 1. Start an `rclcpp_components` container
 2. Load `RollingBonxai::RollingBonxaiServer` into that container
-3. Start a Foxglove Bridge for visualization
+3. Start a Foxglove Bridge for visualization (unless `launch_foxglove:=false`)
 
 > **Point cloud source:** The node subscribes to the topic defined in `topic_in` (default: `/zed/zed_node/point_cloud/cloud_registered`). Make sure your sensor driver is running and publishing to this topic before or alongside this launch file.
 
@@ -99,6 +129,46 @@ ros2 run rolling_bonxai_ros rolling_bonxai_server_node \
 
 ---
 
+## Simulated Time
+
+Rolling Bonxai honours the standard ROS 2 `use_sim_time` parameter. Set it to `true` whenever something else in the graph is the authority on time — Gazebo or another simulator, or a bag replayed with `ros2 bag play --clock`:
+
+```bash
+ros2 launch rolling_bonxai_ros rolling_bonxai_mapping.launch.py use_sim_time:=true
+```
+
+```bash
+ros2 run rolling_bonxai_ros rolling_bonxai_server_node \
+  --ros-args --params-file rolling_bonxai_params.yaml -p use_sim_time:=true
+```
+
+The server prints the active time source at startup, so a mis-set flag is visible in the first few lines of the log:
+
+```
+[INFO] [rolling_bonxai_server]: RollingBonxaiServer started (use_sim_time=true, clock=/clock)
+```
+
+**What follows simulated time**
+
+| Concern | Behaviour under `use_sim_time:=true` |
+|---------|--------------------------------------|
+| Statistics publisher (`stats.publish_rate`) | Fires on ROS time, so the configured rate holds at any real-time factor |
+| Chunk marker publisher (`stats.chunk_vis_publish_rate`) | Same |
+| Periodic memory cleanup (`server.cleanup_interval_sec`) | Same |
+| Message header stamps | Stamped with `now()`, i.e. simulated time |
+| TF lookups | Performed at the incoming cloud's own stamp |
+| Chunk ageing (`temporal.max_age_s`) | Measured in **simulated** seconds |
+
+The last row is the one that is easy to miss. The `temporal` loading policy expires chunks by age, and that age is now measured on the node clock rather than on a steady clock. A simulation running at 5x real time would otherwise expire chunks five times too early, and a paused simulation would keep expiring them while the robot has not moved at all.
+
+**Caveats**
+
+- Under `use_sim_time:=true` **nothing fires until `/clock` starts publishing**. A node that looks hung on startup is usually waiting for a simulator that has not been started yet.
+- Timers are created on the node clock rather than as wall timers, so they also stop while the simulation is paused. This is intended.
+- If your point clouds arrive with an all-zero header stamp, the TF lookup falls back to "latest available transform" rather than failing on every cloud.
+
+---
+
 ## Parameter Reference
 
 All parameters are scoped under `rolling_bonxai_server_node/ros__parameters/`. The YAML hierarchy below mirrors the parameter file structure.
@@ -108,7 +178,7 @@ All parameters are scoped under `rolling_bonxai_server_node/ros__parameters/`. T
 | Parameter | Type | Default | Unit / Significance |
 |-----------|------|---------|---------------------|
 | `frame_id` | string | `"map"` | The global fixed frame. All map data is stored in this frame. |
-| `base_frame_id` | string | `"base_footprint"` | The robot base frame used for TF lookups. |
+| `base_frame_id` | string | `"base_footprint"` | **Currently unused.** Reserved for future base-frame queries. TF lookups resolve the incoming cloud's own `header.frame_id` to `frame_id`, so changing this has no effect today. |
 | `topic_in` | string | `"/points"` | The `sensor_msgs/PointCloud2` topic to subscribe to. **Must match your sensor's output topic.** |
 
 ### Occupancy Settings (`occupancy.*`)
@@ -148,7 +218,9 @@ These parameters control the Bayesian occupancy update. All probability values a
 
 | Parameter | Type | Default | Unit / Significance |
 |-----------|------|---------|---------------------|
-| `rolling.loading_policy.name` | string | `"neighbourhood"` | **Unitless string.** Selects the chunk management strategy. Options: `"neighbourhood"`, `"planar"`, `"temporal"`. |
+| `rolling.loading_policy.name` | string | `"neighbourhood"` | **Unitless string.** Selects the chunk management strategy. Options: `"neighbourhood"` (`"neighborhood"` is also accepted), `"planar"`, `"temporal"`. Matching is case-insensitive; an unrecognised name logs a warning and falls back to `"neighbourhood"`. |
+
+Each policy has its own `radius`. They are read independently, so tuning `planar.radius` does not affect `neighborhood.radius` and vice versa.
 
 **Neighbourhood Policy** (`rolling.loading_policy.neighborhood.*`):
 
@@ -171,13 +243,13 @@ These parameters control the Bayesian occupancy update. All probability values a
 |-----------|------|---------|---------------------|
 | `temporal.radius` | int | `2` | **Unitless (chunks).** Chebyshev radius, same as neighbourhood. |
 | `temporal.age_weightage` | double | `0.3` | **Unitless [0.0, 1.0].** Blend factor between distance-based priority (0.0) and age-based priority (1.0). A value of 0.3 means 70% distance priority + 30% freshness priority when ordering load requests. |
-| `temporal.max_age_s` | int | `300` | **Seconds (s).** Chunks older than this are considered stale and excluded from loading. Useful in dynamic environments. |
+| `temporal.max_age_s` | int | `300` | **Seconds (s) on the node clock.** Chunks older than this are considered stale and excluded from loading. Useful in dynamic environments. Under `use_sim_time:=true` these are *simulated* seconds, so the value means the same thing at any real-time factor. |
 
 ### Rolling / Storage (`rolling.storage.*`)
 
 | Parameter | Type | Default | Unit / Significance |
 |-----------|------|---------|---------------------|
-| `rolling.storage.full_save_folder_path` | string | `""` | **Unitless path string.** Full filesystem path where chunk files (`.chunk`) and timestamp files (`.timestamp`) are saved to and loaded from. Must be readable and writable by the process. Example: `"/home/robot/bonxai_chunks"`. |
+| `rolling.storage.full_save_folder_path` | string | `""` | **Unitless path string.** Full filesystem path where chunk files (`.chunk`) and timestamp files (`.timestamp`) are saved to and loaded from. Must be readable and writable by the process. Example: `"/home/robot/bonxai_chunks"`. If `enable_io` is `true` and this is empty or unwritable, the node logs an error and falls back to memory-only operation rather than failing every save silently. |
 
 ### Rolling / Async I/O (`rolling.asyncio.*`)
 
@@ -187,11 +259,14 @@ These parameters control the Bayesian occupancy update. All probability values a
 | `rolling.asyncio.num_load_threads` | int | `3` | **Unitless (thread count).** Number of dedicated worker threads for loading chunks from disk. Higher values allow more concurrent loads but consume more CPU. |
 | `rolling.asyncio.num_save_threads` | int | `1` | **Unitless (thread count).** Number of dedicated worker threads for saving chunks to disk. Saves are naturally serialised per-chunk (different files), so 1 is usually sufficient. |
 
+> **Shutdown persistence:** chunks are normally written only when the loading policy evicts them, which means everything mapped since the last eviction lives only in memory. On shutdown the server flushes every dirty chunk and waits for those saves to drain, so a clean `Ctrl-C` does not discard the neighbourhood the robot is standing in. The wait is bounded — if saves cannot drain in time the node logs an error rather than hanging.
+
 ### Server (`server.*`)
 
 | Parameter | Type | Default | Unit / Significance |
 |-----------|------|---------|---------------------|
-| `server.cleanup_interval_sec` | double | `300.0` | **Seconds (s).** How often the `/rolling_bonxai/clean_memory` maintenance cycle should be offered. Note: cleanup is actually triggered via the `/rolling_bonxai/clean_memory` service call; this setting is retained for future automatic scheduling. |
+| `server.cleanup_interval_sec` | double | `300.0` | **Seconds (s) on the node clock.** How often `releaseUnusedMemory()` + `shrinkToFit()` run automatically. Cycles are skipped while chunk I/O is in flight and retried next interval. Set to `0.0` or below to disable and rely solely on the `/rolling_bonxai/clean_memory` service. |
+| `server.tf_timeout_sec` | double | `0.1` | **Seconds (s).** How long the point cloud callback blocks waiting for the sensor → `frame_id` transform before dropping the cloud. Raise it if TF arrives late relative to the point cloud. |
 
 ### Stats / Visualization (`stats.*`)
 
@@ -200,7 +275,8 @@ These parameters control the Bayesian occupancy update. All probability values a
 | `stats.enable_stats` | bool | `true` | **Unitless boolean.** Enables statistics publishers and the occupied-voxel point cloud publisher. Disable to reduce CPU overhead in production. |
 | `stats.quick_stats` | bool | `true` | **Unitless boolean.** If `true`, only fast O(1) statistics are published (cell counts, memory). If `false`, full per-cell iteration is run (bounding box, probability distributions) — expensive at high map sizes. |
 | `stats.publish_occupied_voxels` | bool | `true` | **Unitless boolean.** Publishes a `sensor_msgs/PointCloud2` of all currently occupied voxels on `/rolling_bonxai/occupied_voxels`. Disable if bandwidth is a concern. |
-| `stats.publish_rate` | double | `3.0` | **Hertz (Hz).** Rate at which statistics and the occupied-voxel cloud are published. |
+| `stats.publish_rate` | double | `3.0` | **Hertz (Hz) on the node clock.** Rate at which statistics and the occupied-voxel cloud are published. Under `use_sim_time:=true` this is a rate in simulated time. |
+| `stats.chunk_vis_publish_rate` | double | `1.0` | **Hertz (Hz) on the node clock.** Rate at which chunk markers and the transition state are published. |
 
 ---
 

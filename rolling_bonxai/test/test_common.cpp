@@ -751,9 +751,18 @@ TEST_F(ManagedChunkTest, MoveAssignmentSelfAssignment) {
     
     ManagedChunk chunk(std::move(map), test_coord_, true);
     
-    // Self-assignment should be safe
+    // Self-assignment should be safe. The self-move is the point of the test,
+    // so silence the warning that correctly flags it everywhere else.
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wself-move"
+#endif
     chunk = std::move(chunk);
-    
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic pop
+#endif
+
+
     // State should be unchanged
     EXPECT_EQ(chunk.getConstMap(), map_ptr);
     EXPECT_EQ(chunk.getChunkCoord(), test_coord_);

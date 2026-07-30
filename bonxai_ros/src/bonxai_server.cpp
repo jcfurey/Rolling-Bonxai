@@ -3,6 +3,12 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
+#include <tf2/exceptions.hpp>
+#include <tf2/time.hpp>
+
+#include <chrono>
+#include <utility>
+
 namespace Bonxai
 {
 
@@ -32,8 +38,36 @@ BonxaiServer::BonxaiServer(const rclcpp::NodeOptions& options)
   init_services();
   init_subscribers();
   init_timers();
-  
-  RCLCPP_INFO(get_logger(), "BonxaiServer initialization complete!");
+
+  // use_sim_time is pre-declared by rclcpp. Report it, because almost every
+  // "the map never updates" report against a simulated robot comes down to this
+  // being false while /clock is the only time source in the graph.
+  const bool use_sim_time = this->get_parameter("use_sim_time").as_bool();
+  RCLCPP_INFO(
+    get_logger(),
+    "BonxaiServer initialization complete! (use_sim_time=%s, clock=%s)",
+    use_sim_time ? "true" : "false",
+    use_sim_time ? "/clock" : "system");
+}
+
+rclcpp::TimerBase::SharedPtr BonxaiServer::create_ros_timer(
+  double rate_hz, std::function<void()> callback)
+{
+  // A non-positive rate yields an infinite or negative period. Both make
+  // rclcpp throw, so clamp and report instead of taking the node down.
+  if (!(rate_hz > 0.0)) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Requested timer rate %.3f Hz is not positive; falling back to 1.0 Hz",
+      rate_hz);
+    rate_hz = 1.0;
+  }
+
+  const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::duration<double>(1.0 / rate_hz));
+
+  return rclcpp::create_timer(
+    this, this->get_clock(), rclcpp::Duration(period), std::move(callback));
 }
 
 void BonxaiServer::load_parameters()
@@ -84,7 +118,10 @@ void BonxaiServer::load_parameters()
   // --- Server ---
   params_.cleanup_interval_sec =
     this->declare_parameter<double>("server.cleanup_interval_sec", 300.0);
-  
+
+  params_.tf_timeout_sec =
+    this->declare_parameter<double>("server.tf_timeout_sec", 0.1);
+
   // --- Statostics ---
   params_.enable_stats =
     this->declare_parameter<bool>("stats.enable_stats", true);
@@ -132,8 +169,16 @@ void BonxaiServer::init_tf()
   RCLCPP_INFO(get_logger(), "Initializing TF...");
   
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+
+  // Give the buffer a ROS-time timer factory. Without it, any timeout-based
+  // wait inside tf2 falls back to a steady-clock wait, which does not line up
+  // with the sim-time stamps on incoming transforms.
+  auto timer_interface = std::make_shared<tf2_ros::CreateTimerROS>(
+    this->get_node_base_interface(), this->get_node_timers_interface());
+  tf_buffer_->setCreateTimerInterface(timer_interface);
+
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-  
+
   RCLCPP_INFO(get_logger(), "TF initialized");
 }
 
@@ -147,10 +192,18 @@ void BonxaiServer::init_publishers()
       "/bonxai/occupancy_stats",
       rclcpp::QoS(10));
     
-    occupied_voxel_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "/bonxai/occupied_voxels",rclcpp::QoS(10));
-  
     RCLCPP_INFO(get_logger(), "Stats publisher created: /bonxai/occupancy_stats");
+
+    // stats.publish_occupied_voxels was declared and logged but never checked,
+    // so the occupied-voxel cloud was published unconditionally — and building
+    // it walks every active cell on each stats tick, which is exactly the cost
+    // this switch exists to avoid.
+    if (params_.publish_occupied_voxels) {
+      occupied_voxel_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/bonxai/occupied_voxels", rclcpp::QoS(10));
+
+      RCLCPP_INFO(get_logger(), "Occupied voxel publisher created: /bonxai/occupied_voxels");
+    }
   }
 }
 
@@ -192,18 +245,23 @@ void BonxaiServer::init_timers()
   RCLCPP_INFO(get_logger(), "Initializing timers...");
   
   // Start cleanup timer
-  cleanup_timer_ = this->create_wall_timer(
-    std::chrono::duration<double>(params_.cleanup_interval_sec),
-    std::bind(&BonxaiServer::cleanup_timer_callback, this));
-  
-  RCLCPP_INFO(get_logger(), "Cleanup timer started: every %.1fs", params_.cleanup_interval_sec);
-  
+  if (params_.cleanup_interval_sec > 0.0) {
+    cleanup_timer_ = create_ros_timer(
+      1.0 / params_.cleanup_interval_sec,
+      std::bind(&BonxaiServer::cleanup_timer_callback, this));
+
+    RCLCPP_INFO(get_logger(), "Cleanup timer started: every %.1fs", params_.cleanup_interval_sec);
+  } else {
+    RCLCPP_INFO(get_logger(), "Cleanup timer disabled (server.cleanup_interval_sec <= 0)");
+  }
+
   // Start stats timer if enabled
   if (params_.enable_stats && stats_publisher_) {
-    stats_timer_ = this->create_wall_timer(
-      std::chrono::duration<double>(1.0 / params_.stats_publish_rate),
+    stats_timer_ = create_ros_timer(
+      params_.stats_publish_rate,
       std::bind(&BonxaiServer::stats_timer_callback, this));
-    
+
+
     RCLCPP_INFO(get_logger(), 
       "Stats publishing enabled: rate=%.1f Hz, quick=%s",
       params_.stats_publish_rate,
@@ -211,26 +269,41 @@ void BonxaiServer::init_timers()
   }
 }
 
-void BonxaiServer::pointcloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+void BonxaiServer::pointcloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
 {
   if (!occupancy_map_) {
     RCLCPP_WARN(get_logger(), "Occupancy map not initialized yet");
     return;
   }
-  
+
+  // An all-zero stamp means the publisher never filled the header. Asking tf2
+  // for transform-at-time-zero is interpreted as "the latest available", which
+  // is the only sensible reading; looking up an actual epoch-zero timestamp
+  // would fail on every cloud.
+  const rclcpp::Time stamp(msg->header.stamp);
+  const tf2::TimePoint lookup_time =
+    (stamp.nanoseconds() == 0)
+      ? tf2::TimePointZero
+      : tf2::TimePoint(std::chrono::nanoseconds(stamp.nanoseconds()));
+
   // Look up transform from sensor frame to map frame
   geometry_msgs::msg::TransformStamped transform_stamped;
   try {
     transform_stamped = tf_buffer_->lookupTransform(
-      params_.frame_id, //target frame: base_link 
-      msg->header.frame_id, //frame where the camera is publshing at
-      msg->header.stamp,
-      rclcpp::Duration::from_seconds(0.1));
-  } catch (tf2::TransformException& ex) {
-    RCLCPP_WARN(get_logger(), "Could not transform: %s", ex.what());
+      params_.frame_id, //target frame: the global map frame
+      msg->header.frame_id, //frame where the camera is publishing at
+      lookup_time,
+      tf2::durationFromSec(params_.tf_timeout_sec));
+  } catch (const tf2::TransformException& ex) {
+    // Throttled: on a mis-configured frame this fires at full sensor rate.
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "TF lookup %s -> %s failed: %s",
+      msg->header.frame_id.c_str(), params_.frame_id.c_str(), ex.what());
     return;
   }
-  
+
+
   // Convert ROS message to PCL
   pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
   pcl::fromROSMsg(*msg, *cloud);
@@ -254,7 +327,20 @@ void BonxaiServer::pointcloud_callback(const sensor_msgs::msg::PointCloud2::Shar
     transform_stamped.transform.rotation.y,
     transform_stamped.transform.rotation.z
   );
-  
+
+  // tf2 screens NaN translations at ingestion (TF_NAN_INPUT) but does not
+  // screen infinities, so an infinite transform from a diverging state
+  // estimator reaches us intact. Every point derived from it would be
+  // non-finite, poisoning the map. Drop the cloud instead.
+  if (!sensor_origin.allFinite() || !rotation.coeffs().allFinite()) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Transform %s -> %s is not finite; dropping cloud",
+      msg->header.frame_id.c_str(), params_.frame_id.c_str());
+    return;
+  }
+
+
   // Transform points to map frame and filter by Z
   std::vector<Eigen::Vector3d> map_points;
   map_points.reserve(cloud->size());
@@ -555,23 +641,27 @@ void BonxaiServer::stats_timer_callback()
     return;
   }
   
-  sensor_msgs::msg::PointCloud2 pcl_msg;
   std::vector<Bonxai::CoordT> coords;
-  occupancy_map_->getOccupiedVoxels(coords);
-  fill_pcl_msg(coords,pcl_msg);
+  if (occupied_voxel_publisher_) {
+    sensor_msgs::msg::PointCloud2 pcl_msg;
+    occupancy_map_->getOccupiedVoxels(coords);
+    fill_pcl_msg(coords, pcl_msg);
+    occupied_voxel_publisher_->publish(pcl_msg);
+  }
 
   bonxai_msgs::msg::OccupancyMapStats msg;
   fill_stats_msg(msg);
   
   stats_publisher_->publish(msg);
-  occupied_voxel_publisher_->publish(pcl_msg);
 
-  RCLCPP_INFO_STREAM(get_logger(),"Got " << coords.size() << "Occupied Voxels!");
-  RCLCPP_INFO(get_logger(),
-    "Stats published: %lu active cells, %.1f MB, occupancy=%.2f%%",
-    msg.total_active_cells,
+  // Debug: this runs at stats_publish_rate (3 Hz by default), and at info level
+  // it buries everything else in the log.
+  RCLCPP_DEBUG(get_logger(),
+    "Stats published: %zu occupied voxels, %lu active cells, %.1f MiB, occupancy=%.2f%%",
+    coords.size(),
+    static_cast<unsigned long>(msg.total_active_cells),
     static_cast<double>(msg.total_memory_mib),
-    msg.occupancy_ratio * 100.0f);
+    static_cast<double>(msg.occupancy_ratio) * 100.0);
 }
 
 }  // namespace Bonxai

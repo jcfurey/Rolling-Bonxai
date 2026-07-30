@@ -1,6 +1,14 @@
 rolling_bonxai_server_node:
   ros__parameters:
+    # Set true when a simulator (Gazebo, Isaac, a bag replayed with --clock)
+    # publishes /clock. Every timer in the node and all chunk ageing then follow
+    # simulated time instead of the wall clock. Nothing fires until /clock
+    # starts publishing, which is the expected behaviour.
+    use_sim_time: false
+
     frame_id: "map"
+    # Currently unused — TF lookups resolve the incoming cloud's own
+    # header.frame_id to frame_id. Reserved for future base-frame queries.
     base_frame_id: "zed_camera_link"
     topic_in: "/zed/zed_node/point_cloud/cloud_registered"
 
@@ -9,7 +17,7 @@ rolling_bonxai_server_node:
       occupancy_min_z: -100.0
       occupancy_max_z: 100.0
       occupancy_threshold: 0.50
-    
+
     sensor_model:
       max_range: 10.0
       hit: 0.7
@@ -20,12 +28,13 @@ rolling_bonxai_server_node:
     rolling:
       coordinate_system:
         chunk_size: 2.0 #double m
-        
+
       transition_manager:
         hysteresis_ratio: 0.2 #[0.01,1.0]
 
       loading_policy:
-        name: "neighborhood" # "planar","temporal" ##String
+        # "neighbourhood" (or "neighborhood"), "planar", "temporal" ##String
+        name: "neighbourhood"
         neighborhood:
           radius: 2 #int
         planar:
@@ -36,10 +45,15 @@ rolling_bonxai_server_node:
         temporal:
           radius: 2 #int
           age_weightage: 0.3 #[0.01,1.0] double
+          # Seconds on the node clock. Under use_sim_time these are simulated
+          # seconds, so the value means the same thing at any real-time factor.
           max_age_s: 300 #int in seconds
 
       storage:
-        full_save_folder_path: "/home/tmp/bonxai_chunks"
+        # Must be writable by this process. Ignored while enable_io is false;
+        # if enable_io is true and this is empty or unwritable, the node logs an
+        # error and falls back to memory-only operation.
+        full_save_folder_path: "/tmp/bonxai_chunks"
 
       asyncio:
         enable_io: false
@@ -47,10 +61,18 @@ rolling_bonxai_server_node:
         num_save_threads: 1 #int
 
     server:
+      # Seconds between automatic releaseUnusedMemory()/shrinkToFit() passes.
+      # Set <= 0.0 to disable and rely solely on the clean_memory service.
       cleanup_interval_sec: 120.0
+      # Seconds to block waiting for the sensor -> frame_id transform.
+      tf_timeout_sec: 0.1
 
     stats:
       enable_stats: true
+      # true  -> O(1) counters only
+      # false -> full per-cell iteration (bounding box, probability spread).
+      #          Expensive on large maps.
       quick_stats: true
       publish_occupied_voxels: true
       publish_rate: 3.0 #Hz
+      chunk_vis_publish_rate: 1.0 #Hz

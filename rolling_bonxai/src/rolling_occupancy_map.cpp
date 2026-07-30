@@ -1,12 +1,34 @@
 #include "rolling_bonxai/rolling_occupancy_map.hpp"
 
-
+#include <algorithm>
+#include <cctype>
+#include <sstream>
+#include <string>
+#include <utility>
 
 namespace RollingBonxai
 {
-RollingOccupancyMap::RollingOccupancyMap(const AllParameters& params, std::shared_ptr<Logger> logger)
+namespace
+{
+/// Case-insensitive comparison, so policy names are not spelling-sensitive
+bool iequals(const std::string& a, const std::string& b)
+{
+    if (a.size() != b.size()) {
+        return false;
+    }
+    return std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+        return std::tolower(static_cast<unsigned char>(x)) ==
+               std::tolower(static_cast<unsigned char>(y));
+    });
+}
+} // namespace
+
+RollingOccupancyMap::RollingOccupancyMap(const AllParameters& params,
+                                         std::shared_ptr<Logger> logger,
+                                         TimeSourceNs time_source)
     :
     params_(params),
+    time_source_(std::move(time_source)),
     logger_(logger)
 {
     // Build factories from MapParams
@@ -15,60 +37,92 @@ RollingOccupancyMap::RollingOccupancyMap(const AllParameters& params, std::share
     // Initialize coordinate system
     c_sys_ = std::make_unique<ChunkCoordinateSystem>(params_.map_params.resolution,params_.chunk_size);
 
-    // Initialise transition manager
-    transition_manager_ = std::make_unique<TransitionManager>(params_.hysteresis_ratio, *c_sys_);
+    // Initialise transition manager. It gets the logger so that a skipped
+    // rolling update — a frozen window, indistinguishable from a stationary
+    // robot — is reported rather than silently swallowed.
+    transition_manager_ = std::make_unique<TransitionManager>(
+        params_.hysteresis_ratio, *c_sys_, logger_);
 
-    // Initialise the loading policy
-    if (params_.loading_policy_name == "neighbourhood") {
+    // Initialise the loading policy.
+    // "neighbourhood" and "neighborhood" are both accepted: the shipped params
+    // file used one spelling and the code the other, so every user of the params
+    // file was silently falling through to the default branch.
+    const std::string& policy_name = params_.loading_policy_name;
+    if (iequals(policy_name, "neighbourhood") || iequals(policy_name, "neighborhood")) {
         loading_policy_ = std::make_unique<NeighborhoodPolicy>(params_.nb_radius);
     }
-    else if (params_.loading_policy_name == "planar") {
+    else if (iequals(policy_name, "planar")) {
         loading_policy_ = std::make_unique<PlanarNeighborhoodPolicy>(
-            params_.nb_radius,
+            params_.planar_radius,
             params_.planar_z_min,
             params_.planar_z_max,
             params_.planar_use_relative);
     }
-    else if (params_.loading_policy_name == "temporal") {
+    else if (iequals(policy_name, "temporal")) {
         loading_policy_ = std::make_unique<TemporalNeighborhoodPolicy>(
-            params_.nb_radius,
+            params_.temporal_radius,
             params_.temporal_age_weightage,
             std::chrono::seconds(params_.temporal_max_age_s));
     }
     else {
-        // Silent default to neighbourhood
+        // Unknown name: fall back, but say so rather than failing silently
         loading_policy_ = std::make_unique<NeighborhoodPolicy>(params_.nb_radius);
+        logger_->log_warn("[RollingBonxai]: Unknown loading policy '" + policy_name
+            + "'. Expected one of: neighbourhood, planar, temporal. "
+              "Falling back to neighbourhood.");
     }
 
     // Initialise the file storage backend
     std::filesystem::path storage_path(params_.full_save_folder_path);
     storage_backend_ = std::make_unique<FileStorageBackend>(storage_path);
-    [[maybe_unused]] bool storage_ok = storage_backend_->initStorageBackend();
+    const bool storage_ok = storage_backend_->initStorageBackend();
+
+    // Disk I/O against a path that cannot be created or written would fail on
+    // every single save. Report it once here and stay in memory-only mode,
+    // instead of emitting one error per evicted chunk for the rest of the run.
+    if (params_.asyncio.enable_io && !storage_ok) {
+        logger_->log_error("[RollingBonxai]: Storage path '"
+            + storage_path.string() + "' is not usable (cannot create or write). "
+              "Disabling disk I/O — the map will be memory-only and chunks "
+              "evicted by the policy will be discarded.");
+        params_.asyncio.enable_io = false;
+    }
 
     // Create the async I/O manager (takes ownership of storage_backend_)
     asyncio_manager_ = std::make_unique<AsyncChunkManager>(
         std::move(storage_backend_), params_.asyncio);
-    
+
     std::ostringstream log_oss;
     log_oss << "[RollingBonxai: Initialised!]\n" <<
-    "VoxelResolution: " << std::to_string(params_.map_params.resolution) << "\n" <<  
+    "VoxelResolution: " << std::to_string(params_.map_params.resolution) << "\n" <<
     "ChunkSize: " << std::to_string(params_.chunk_size) << "\n" <<
     "Hysteresis:" << std::to_string(params_.hysteresis_ratio) << "\n" <<
-    "LoadEvictPolicy: " << loading_policy_->getName() << "\n" << 
-    "IO Enabled: " << params_.asyncio.enable_io << "\n";
+    "LoadEvictPolicy: " << loading_policy_->getName() << "\n" <<
+    "IO Enabled: " << (params_.asyncio.enable_io ? "true" : "false") << "\n" <<
+    "Clock: " << (time_source_ ? "injected (follows ROS/sim time)" : "steady_clock") << "\n";
 
     logger_->log_info(log_oss.str());
 }
 
 RollingOccupancyMap::~RollingOccupancyMap()
 {
-    // AsyncChunkManager destructor handles thread shutdown.
-    // Dirty chunks should be flushed by updateRolling / graceful shutdown
-    // before reaching this point. Log a warning if there are still active chunks.
-    if (!active_chunks_.empty()) {
-        logger_->log_warn("[RollingBonxai]: RollingOccupancyMap destroyed with " 
-            + std::to_string(active_chunks_.size()) + " active chunks remaining");
+    // Chunks are only written to disk when the policy evicts them, so on exit
+    // everything currently in memory is unsaved. Flush before the
+    // AsyncChunkManager is destroyed and its worker threads are joined.
+    const size_t flushed = flushAllChunks();
+    if (flushed > 0) {
+        logger_->log_info("[RollingBonxai]: Flushed " + std::to_string(flushed)
+            + " dirty chunk(s) on shutdown");
     }
+}
+
+int64_t RollingOccupancyMap::nowNs() const
+{
+    if (time_source_) {
+        return time_source_();
+    }
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 // ============================================================================
@@ -121,8 +175,10 @@ void RollingOccupancyMap::updateOccupancy(const std::vector<Vector3D>& points,
         return;
     }
 
-    logger_->log_info("[RollingBonxai]: Dispatching rays to chunks");
-    
+    // Debug, not info: this fires once per incoming cloud (sensor rate), and at
+    // 30 Hz an info-level line here drowns out everything else in the log.
+    logger_->log_debug("[RollingBonxai]: Dispatching rays to chunks");
+
     // square of max range for quick comparisons
     const double max_range_sq = max_range * max_range;
 
@@ -281,8 +337,7 @@ void RollingOccupancyMap::updateRolling(
     // Step 4: Update metadata for the current reference chunk
     // ------------------------------------------------------------------
     const ChunkCoord current_chunk = transition_manager_->getRefChunkCoord();
-    auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t now_ns = nowNs();
 
     auto& meta = chunk_metadata_[current_chunk];
     meta.last_access_time = now_ns;
@@ -323,15 +378,16 @@ void RollingOccupancyMap::pollPendingLoads()
 
                     // Initialise metadata if not already present
                     if (chunk_metadata_.find(coord) == chunk_metadata_.end()) {
-                        auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                        const int64_t now_ns = nowNs();
                         ChunkMetadata meta;
                         meta.creation_time = now_ns;
                         meta.last_access_time = now_ns;
                         meta.access_count = 1;
                         chunk_metadata_[coord] = meta;
                     }
-                    logger_->log_info("[RollingBonxai]: Loading to active -> chunk ("
+                    // Debug: a radius-2 neighbourhood is 124 chunks, so one
+                    // info line each buries the log on every transition.
+                    logger_->log_debug("[RollingBonxai]: Loading to active -> chunk ("
                         + std::to_string(coord.x) + "," + std::to_string(coord.y) + ","
                         + std::to_string(coord.z) + ")");
                 } 
@@ -369,8 +425,10 @@ void RollingOccupancyMap::pollPendingLoads()
 void RollingOccupancyMap::performTransition(const ChunkCoord& ref_chunk,
                                             const Vector3D& source)
 {
-    // Get the time now
-    const auto now = std::chrono::steady_clock::now();
+    // Stamp from the injected time source so the temporal policy compares
+    // against chunk metadata written from that same clock.
+    const auto now = std::chrono::steady_clock::time_point(
+        std::chrono::nanoseconds(nowNs()));
 
     // Build the policy context
     PolicyContext policy_ctx(source, ref_chunk, now, chunk_metadata_);
@@ -382,8 +440,10 @@ void RollingOccupancyMap::performTransition(const ChunkCoord& ref_chunk,
     std::unordered_set<ChunkCoord, ChunkCoordHash> desired_set;
     desired_set.insert(ref_chunk);
 
-    // Iterate all neighbours within the policy radius
-    const int radius = params_.nb_radius;
+    // Iterate all neighbours within the policy's own search radius. Using
+    // nb_radius here meant the planar policy's vertical range was clipped to the
+    // neighbourhood radius, so chunks it wanted were never even offered to it.
+    const int radius = loading_policy_->getSearchRadius();
     ChunkCoordinateSystem::forEachNeighbour(ref_chunk, radius,
         [&](const ChunkCoord& candidate) {
             if (loading_policy_->shouldLoad(candidate, policy_ctx)) {
@@ -434,7 +494,7 @@ void RollingOccupancyMap::performTransition(const ChunkCoord& ref_chunk,
             pending_loads_[coord] = std::move(future_opt.value());
         }
     }
-    logger_->log_info("[RollingBonxai]: Async Loads Issued!");
+    logger_->log_debug("[RollingBonxai]: Async Loads Issued!");
     // ------------------------------------------------------------------
     // C. Evict: save-if-dirty, then remove chunks the policy no longer wants
     // ------------------------------------------------------------------
@@ -470,13 +530,13 @@ void RollingOccupancyMap::performTransition(const ChunkCoord& ref_chunk,
                 [[maybe_unused]] auto future_bool = 
                 asyncio_manager_->saveAsync(coord, std::move(map_uptr->getGrid()));
             }
-            logger_->log_info("[RollingBonxai]: (Direct) Saving dirty chunk ("
+            logger_->log_debug("[RollingBonxai]: (Direct) Saving dirty chunk ("
             + std::to_string(coord.x) + "," + std::to_string(coord.y) + ","
             + std::to_string(coord.z) + ")");
-            
+
         }
         else{
-            logger_->log_info("[RollingBonxai]: (Lazy) Not saving clean chunk ("
+            logger_->log_debug("[RollingBonxai]: (Lazy) Not saving clean chunk ("
             + std::to_string(coord.x) + "," + std::to_string(coord.y) + ","
             + std::to_string(coord.z) + ")");
         }
@@ -487,7 +547,7 @@ void RollingOccupancyMap::performTransition(const ChunkCoord& ref_chunk,
         // Note: we intentionally keep chunk_metadata_ for this coord.
         // The temporal policy may need historical metadata for future decisions.
     }
-    logger_->log_info("[RollingBonxai]: Async saves issued!");
+    logger_->log_debug("[RollingBonxai]: Async saves issued!");
 
     logger_->log_info("[RollingBonxai]: performTransition: ref=("
         + std::to_string(ref_chunk.x) + "," + std::to_string(ref_chunk.y) + ","
@@ -745,6 +805,49 @@ void RollingOccupancyMap::shrinkToFit()
         }
     );
     logger_->log_info("[RollingBonxai]: Shrinking buffers!");
+}
+
+size_t RollingOccupancyMap::flushAllChunks()
+{
+    if (!asyncio_manager_) {
+        return 0;
+    }
+
+    // Collect first: forEachChunk holds the container while iterating, and the
+    // save path both mutates the chunk and erases it from storage.
+    std::vector<ChunkCoord> dirty;
+    dirty.reserve(active_chunks_.size());
+    active_chunks_.forEachChunk(
+        [&dirty](const ChunkCoord& coord, const ManagedChunk& chunk) {
+            if (chunk.isDirty() && chunk.getConstMap()) {
+                dirty.push_back(coord);
+            }
+        }
+    );
+
+    size_t saved = 0;
+    for (const auto& coord : dirty) {
+        ManagedChunk* managed = active_chunks_.find(coord);
+        if (!managed || !managed->isMapValid()) {
+            continue;
+        }
+        auto map_uptr = managed->transferMapOwnership();
+        if (map_uptr) {
+            [[maybe_unused]] auto fut =
+                asyncio_manager_->saveAsync(coord, std::move(map_uptr->getGrid()));
+            ++saved;
+        }
+    }
+
+    // Wait here rather than leaning on the AsyncChunkManager destructor, so that
+    // an explicit flush() from a node's shutdown path is synchronous.
+    if (saved > 0 && !asyncio_manager_->waitForPendingSaves()) {
+        logger_->log_error("[RollingBonxai]: Timed out waiting for chunk saves to "
+                           "drain; some chunks may not have reached disk");
+    }
+
+    active_chunks_.clear();
+    return saved;
 }
 
 // ============================================================================

@@ -7,8 +7,12 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
-#include <tf2_ros/transform_listener.h>
-#include <tf2_ros/buffer.h>
+// tf2 headers were renamed to .hpp in Jazzy; the legacy .h spellings are
+// deprecation shims that are removed in later distros. Use .hpp so the same
+// source builds on Jazzy and Lyrical.
+#include <tf2_ros/transform_listener.hpp>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/create_timer_ros.hpp>
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
@@ -44,10 +48,16 @@ struct ServerParams
 
   double cleanup_interval_sec{300.0};
 
+  /// How long to block waiting for the sensor->map transform, in seconds
+  double tf_timeout_sec{0.1};
+
   bool enable_stats{true};
   bool quick_stats{true};
   bool publish_occupied_voxels{true};
   double stats_publish_rate{1.0};
+
+  /// Rate of the chunk marker / transition state publisher, in Hz
+  double chunk_vis_publish_rate{1.0};
 };
 
 class RollingBonxaiServer : public rclcpp::Node
@@ -55,6 +65,11 @@ class RollingBonxaiServer : public rclcpp::Node
 public:
   explicit RollingBonxaiServer(
     const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
+
+  /**
+   * @brief Flush every dirty chunk to disk before the node is torn down
+   */
+  ~RollingBonxaiServer() override;
 
 private:
   /**
@@ -114,6 +129,11 @@ private:
   std::shared_ptr<std_srvs::srv::Trigger::Response> response);
 
   /**
+   * @brief Periodic memory cleanup, scheduled by server.cleanup_interval_sec
+   */
+  void cleanupTimerCallback();
+
+  /**
    * @brief Publish chunk visualization and transition state
    *
    * Chunk visualization:
@@ -129,7 +149,22 @@ private:
    * @brief Handle incoming sensor point clouds
    */
   void pointcloudCallback(
-    const sensor_msgs::msg::PointCloud2::SharedPtr msg);
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+
+  /**
+   * @brief Create a timer driven by the node clock
+   *
+   * Deliberately not create_wall_timer(): wall timers run off the steady clock
+   * and therefore ignore /clock entirely. Under use_sim_time these callbacks
+   * must follow simulated time, so that a simulation running at 0.2x real time
+   * does not publish stats five times more often than configured (and keeps
+   * firing while the simulation is paused).
+   *
+   * @param rate_hz Firing rate in Hz (must be > 0)
+   * @param callback Callback to invoke
+   */
+  rclcpp::TimerBase::SharedPtr createRosTimer(
+    double rate_hz, std::function<void()> callback);
 
 private:
   ServerParams server_params_;
@@ -153,10 +188,16 @@ private:
   // Services
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clean_memory_srv_;
 
+  // Periodic maintenance
+  rclcpp::TimerBase::SharedPtr cleanup_timer_;
+
   // Chunk visualization
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr chunk_marker_pub_;
   rclcpp::Publisher<rolling_bonxai_msgs::msg::RollingState>::SharedPtr transition_state_pub_;
   rclcpp::TimerBase::SharedPtr chunk_vis_timer_;
+
+  /// Highest marker id published last cycle, so stale cubes can be deleted
+  int last_marker_count_{0};
 };
 
 } // namespace RollingBonxai

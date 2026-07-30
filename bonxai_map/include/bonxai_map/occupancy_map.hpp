@@ -5,7 +5,7 @@
 #include <optional>
 #include <cmath>
 #include <algorithm>
-#include <eigen3/Eigen/Geometry>
+#include <Eigen/Geometry>
 
 #include "bonxai_core/bonxai.hpp"
 

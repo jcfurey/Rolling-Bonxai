@@ -2,12 +2,12 @@
 # .docker/devcontainer_on_create.sh
 #
 # Runs ONCE when the devcontainer is first created.
-# Works for both the Humble and Jazzy variants — the active distro
+# Works for both the Jazzy and Lyrical variants — the active distro
 # is read from $ROS_DISTRO which is set by the base image.
 
 set -euo pipefail
 
-DISTRO="${ROS_DISTRO:-humble}"
+DISTRO="${ROS_DISTRO:?ROS_DISTRO is not set — this script expects the ROS base image environment}"
 
 echo "═══════════════════════════════════════════════════════"
 echo "  Rolling Bonxai devcontainer — first-time setup"

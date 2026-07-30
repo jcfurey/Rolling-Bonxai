@@ -3,13 +3,13 @@
 #
 # ROS 2 Jazzy (Ubuntu 24.04 Noble) build of Rolling Bonxai.
 #
-# Use this when you want to develop / run Rolling Bonxai on
-# Jazzy while the SITL container stays on Humble.  DDS
-# (Fast-DDS / CycloneDDS) is wire-compatible between Humble and
-# Jazzy on the same ROS_DOMAIN_ID, so topics cross the distro
+# Rolling Bonxai supports Jazzy and Lyrical. Use this image to check
+# the older of the two; .docker/Dockerfile.rolling_bonxai_lyrical is
+# the Lyrical equivalent. DDS (Fast-DDS / CycloneDDS) is wire-compatible
+# across distros on the same ROS_DOMAIN_ID, so topics cross the distro
 # boundary transparently on network_mode: host.
 #
-# Two-stage build (same pattern as the Humble Dockerfile):
+# Two-stage build (same pattern as the Lyrical Dockerfile):
 #   deps  — all apt deps, no source  (devcontainer uses this)
 #   build — colcon build             (compose uses this)
 #
@@ -38,6 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-rosdep \
     python3-pip \
     # ROS 2 Jazzy packages needed by rolling_bonxai_ros
+    ros-jazzy-ament-cmake-auto \
     ros-jazzy-tf2-ros \
     ros-jazzy-tf2-eigen \
     ros-jazzy-sensor-msgs \

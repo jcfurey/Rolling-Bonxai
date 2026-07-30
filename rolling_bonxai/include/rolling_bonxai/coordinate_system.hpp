@@ -2,7 +2,7 @@
 #include "bonxai_core/bonxai.hpp"
 #include "bonxai_map/occupancy_map.hpp"
 #include "rolling_bonxai/common.hpp"
-#include <eigen3/Eigen/Geometry>
+#include <Eigen/Geometry>
 
 #include <cmath>
 #include <limits>

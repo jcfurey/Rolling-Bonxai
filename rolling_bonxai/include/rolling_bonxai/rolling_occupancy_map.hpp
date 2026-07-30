@@ -19,8 +19,10 @@
 #include <atomic>
 #include <optional>
 #include <chrono>
+#include <cstdint>
 #include <future>
 #include <functional>
+#include <string>
 #include <cmath>
 
 namespace RollingBonxai
@@ -59,6 +61,25 @@ public:
     using OccupancyMapFactory = std::function<std::unique_ptr<Bonxai::OccupancyMap>()>;
     using OccupancyOptionsFactory = std::function<Bonxai::Occupancy::OccupancyOptions()>;
 
+    /**
+     * @brief Source of "now", in nanoseconds, for chunk ageing decisions
+     *
+     * The engine never calls a clock directly. Everything that ages a chunk —
+     * metadata timestamps and the PolicyContext handed to the temporal policy —
+     * is stamped from this one function, so all comparisons stay inside a single
+     * time domain.
+     *
+     * Under a ROS node running with `use_sim_time:=true`, the server injects
+     * `node->now()`. A `max_age_s` of 300 then means 300 *simulated* seconds:
+     * with steady_clock a simulation running at 5x real time would expire chunks
+     * five times too early, and a paused simulation would expire them while the
+     * robot has not moved at all.
+     *
+     * Defaults to std::chrono::steady_clock when not supplied, which is the
+     * right behaviour for non-ROS users and for `use_sim_time:=false`.
+     */
+    using TimeSourceNs = std::function<int64_t()>;
+
     // ========================================================================
     // Configuration
     // ========================================================================
@@ -77,12 +98,17 @@ public:
         /// Hysteresis ratio for the TransitionManager (fraction of chunk size)
         double hysteresis_ratio{0.20};
 
-        /// Loading policy selection and parameters
+        /// Loading policy selection and parameters.
+        /// Each policy carries its own radius: they are tuned independently and
+        /// a shared one made the documented planar.radius / temporal.radius
+        /// settings dead knobs.
         std::string loading_policy_name{"neighbourhood"};
         int nb_radius{2};
+        int planar_radius{1};
         int planar_z_min{1};
         int planar_z_max{3};
         bool planar_use_relative{false};
+        int temporal_radius{2};
         double temporal_age_weightage{0.3};
         int temporal_max_age_s{300};
 
@@ -105,10 +131,19 @@ public:
      * 
      * @param all_params Configuration parameters
      * @param logger Shared pointer to a Logger implementation (e.g., RosLogger)
+     * @param time_source Optional clock for chunk ageing (see TimeSourceNs).
+     *        Pass the node clock to make ageing follow sim time; leave empty to
+     *        use std::chrono::steady_clock.
      */
-    RollingOccupancyMap(const AllParameters& all_params, std::shared_ptr<Logger> logger);
+    RollingOccupancyMap(const AllParameters& all_params,
+                        std::shared_ptr<Logger> logger,
+                        TimeSourceNs time_source = nullptr);
 
-    /// Destructor
+    /**
+     * @brief Destructor
+     *
+     * Flushes every dirty chunk to disk before tearing down the I/O manager.
+     */
     ~RollingOccupancyMap();
 
     /// Non-copyable
@@ -263,6 +298,21 @@ public:
      * 
      */
     void shrinkToFit();
+
+    /**
+     * @brief Save every dirty chunk to disk and drop all active chunks
+     *
+     * Called by the destructor, and safe to call explicitly on shutdown before
+     * the node is torn down. Without this, everything mapped since the last
+     * eviction — normally the entire neighbourhood around the robot — is lost
+     * on exit, because chunks are only written when the policy evicts them.
+     *
+     * Blocks until the queued saves have drained (bounded by the async I/O
+     * shutdown timeout).
+     *
+     * @return Number of dirty chunks handed to the save pipeline
+     */
+    size_t flushAllChunks();
 
     // ========================================================================
     // Query Interface
@@ -514,12 +564,20 @@ private:
      */
     void buildFactories();
 
+    /**
+     * @brief Current time in nanoseconds, from the injected time source
+     */
+    [[nodiscard]] int64_t nowNs() const;
+
     // ========================================================================
     // Member Variables
     // ========================================================================
 
     /// Configuration
     AllParameters params_;
+
+    /// Clock used for every chunk-ageing decision (see TimeSourceNs)
+    TimeSourceNs time_source_;
 
     /// Coordinate system for chunk spatial indexing
     std::unique_ptr<ChunkCoordinateSystem> c_sys_;

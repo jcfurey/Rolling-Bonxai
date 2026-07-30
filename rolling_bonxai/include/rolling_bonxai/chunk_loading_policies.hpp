@@ -57,16 +57,18 @@ public:
     [[nodiscard]] std::string getName() const override;
     
     [[nodiscard]] std::string getDescription() const override;
-    
+
+    [[nodiscard]] int getSearchRadius() const override;
+
     /**
      * @brief Get configured radius
      * @return Radius in chunks
      */
     [[nodiscard]] int getRadius() const;
-    
+
 private:
     int radius_;  ///< Chebyshev distance radius (in chunks)
-    
+
 }; // class NeighborhoodPolicy
 
 
@@ -145,7 +147,15 @@ public:
     [[nodiscard]] std::string getName() const override;
     
     [[nodiscard]] std::string getDescription() const override;
-    
+
+    /**
+     * @brief Enumeration radius
+     *
+     * The vertical extent is independent of the horizontal radius, so the cube
+     * that must be walked is bounded by the largest of the three.
+     */
+    [[nodiscard]] int getSearchRadius() const override;
+
     /**
      * @brief Get configured parameters
      */
@@ -218,7 +228,9 @@ public:
     [[nodiscard]] std::string getName() const override;
     
     [[nodiscard]] std::string getDescription() const override;
-    
+
+    [[nodiscard]] int getSearchRadius() const override;
+
     /**
      * @brief Get configured parameters
      */

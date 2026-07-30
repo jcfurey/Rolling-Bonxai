@@ -1,6 +1,14 @@
 #include <gtest/gtest.h>
+
+#include <limits>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
 #include "rolling_bonxai/transition_manager.hpp"
 #include "rolling_bonxai/coordinate_system.hpp"
+#include "rolling_bonxai/logger.hpp"
 
 using namespace RollingBonxai;
 
@@ -606,6 +614,235 @@ TEST_F(TransitionManagerTest, PenetrationCalculationFaceTransition) {
         EXPECT_EQ(tm_->getRefTransitionState(), test.expected_state)
             << "Failed at x=" << test.x << " (penetration=" << test.expected_penetration << ")";
     }
+}
+
+// ============================================================================
+// NON-FINITE EGO POSES
+// ============================================================================
+//
+// shouldTriggerTransition() runs inside the point cloud subscription callback,
+// so anything it throws escapes the executor and terminates the node. A NaN
+// from a diverged localiser used to do exactly that: every comparison in
+// isPositionInChunk() is false for NaN, so distanceToBoundary() reported the
+// ego as outside the chunk it had just been classified into, which produced
+// UNINITIALIZED and hit the throw. These pin the non-throwing behaviour.
+
+TEST_F(TransitionManagerTest, NonFinitePositionDoesNotThrowBeforeInit) {
+    auto nan_ctx = makeContext(std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0);
+
+    EXPECT_NO_THROW({
+        EXPECT_FALSE(tm_->shouldTriggerTransition(nan_ctx));
+    });
+}
+
+TEST_F(TransitionManagerTest, NonFinitePositionDoesNotThrowAfterInit) {
+    // Initialise normally at the origin
+    auto ctx = makeContext(0.0, 0.0, 0.0);
+    EXPECT_TRUE(tm_->shouldTriggerTransition(ctx));
+
+    const ChunkCoord chunk_before = tm_->getRefChunkCoord();
+    const TransitionState state_before = tm_->getRefTransitionState();
+
+    for (double bad : {std::numeric_limits<double>::quiet_NaN(),
+                       std::numeric_limits<double>::infinity(),
+                       -std::numeric_limits<double>::infinity()}) {
+        auto bad_ctx = makeContext(bad, 0.0, 0.0);
+        EXPECT_NO_THROW({
+            EXPECT_FALSE(tm_->shouldTriggerTransition(bad_ctx));
+        });
+
+        // A bad pose must not disturb the state machine either
+        EXPECT_EQ(tm_->getRefChunkCoord(), chunk_before);
+        EXPECT_EQ(tm_->getRefTransitionState(), state_before);
+    }
+}
+
+TEST_F(TransitionManagerTest, RecoversAfterNonFinitePosition) {
+    auto ctx = makeContext(0.0, 0.0, 0.0);
+    tm_->shouldTriggerTransition(ctx);
+
+    auto nan_ctx = makeContext(std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0);
+    EXPECT_FALSE(tm_->shouldTriggerTransition(nan_ctx));
+
+    // A valid pose far enough into the next chunk must still transition, i.e.
+    // the bad cycle was skipped rather than latching the manager into a
+    // permanently broken state.
+    auto far_ctx = makeContext(chunk_size_, 0.0, 0.0);
+    EXPECT_TRUE(tm_->shouldTriggerTransition(far_ctx));
+    EXPECT_EQ(tm_->getRefChunkCoord(), ChunkCoord(1, 0, 0));
+}
+
+// ============================================================================
+// DEGRADED-INPUT REPORTING
+// ============================================================================
+//
+// Skipping a cycle instead of throwing keeps the node alive, but a frozen
+// rolling window looks exactly like a stationary robot, so the skip has to be
+// audible. It also has to be bounded: skips arrive at sensor rate, and a line
+// per skip would bury the log.
+
+namespace {
+
+/// Logger that records everything it is handed, for assertions
+class RecordingLogger : public Logger
+{
+public:
+    void log_debug(const std::string& s) override { debug.push_back(s); }
+    void log_info(const std::string& s) override { info.push_back(s); }
+    void log_warn(const std::string& s) override { warn.push_back(s); }
+    void log_error(const std::string& s) override { error.push_back(s); }
+    void log_fatal(const std::string& s) override { fatal.push_back(s); }
+
+    std::vector<std::string> debug, info, warn, error, fatal;
+};
+
+} // namespace
+
+class TransitionManagerLoggingTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        chunk_size_ = 10.0;
+        csys_ = std::make_unique<ChunkCoordinateSystem>(0.2, chunk_size_);
+        log_ = std::make_shared<RecordingLogger>();
+        tm_ = std::make_unique<TransitionManager>(0.2, *csys_, log_);
+    }
+
+    TransitionManagerContext ctxAt(double x) {
+        TransitionManagerContext ctx;
+        ctx.ego_position = Position3D(x, 0.0, 0.0);
+        ctx.ego_velocity = LinearVelocity3D(0.0, 0.0, 0.0);
+        return ctx;
+    }
+
+    TransitionManagerContext nanCtx() {
+        return ctxAt(std::numeric_limits<double>::quiet_NaN());
+    }
+
+    double chunk_size_;
+    std::unique_ptr<ChunkCoordinateSystem> csys_;
+    std::shared_ptr<RecordingLogger> log_;
+    std::unique_ptr<TransitionManager> tm_;
+};
+
+TEST_F(TransitionManagerLoggingTest, FirstNonFiniteSkipIsReported) {
+    tm_->shouldTriggerTransition(ctxAt(0.0));
+    log_->warn.clear();
+
+    EXPECT_FALSE(tm_->shouldTriggerTransition(nanCtx()));
+
+    ASSERT_EQ(log_->warn.size(), 1u);
+    EXPECT_NE(log_->warn[0].find("not finite"), std::string::npos);
+    // The operator needs to know the consequence, not just the cause
+    EXPECT_NE(log_->warn[0].find("frozen"), std::string::npos);
+    EXPECT_EQ(tm_->getNonFinitePoseSkipCount(), 1u);
+}
+
+TEST_F(TransitionManagerLoggingTest, SustainedBadPosesAreRateLimited) {
+    tm_->shouldTriggerTransition(ctxAt(0.0));
+    log_->warn.clear();
+
+    // A full minute of bad poses at 30 Hz
+    for (int i = 0; i < 1800; ++i) {
+        tm_->shouldTriggerTransition(nanCtx());
+    }
+
+    EXPECT_EQ(tm_->getNonFinitePoseSkipCount(), 1800u);
+    // Bounded, but not silent: a handful of lines, nowhere near 1800
+    EXPECT_GE(log_->warn.size(), 1u);
+    EXPECT_LE(log_->warn.size(), 10u);
+}
+
+TEST_F(TransitionManagerLoggingTest, RecoveryIsReported) {
+    tm_->shouldTriggerTransition(ctxAt(0.0));
+    log_->warn.clear();
+
+    tm_->shouldTriggerTransition(nanCtx());
+    tm_->shouldTriggerTransition(nanCtx());
+    tm_->shouldTriggerTransition(ctxAt(0.0));   // valid again
+
+    ASSERT_GE(log_->warn.size(), 2u);
+    EXPECT_NE(log_->warn.back().find("recovered"), std::string::npos);
+    EXPECT_NE(log_->warn.back().find("2 skipped cycle"), std::string::npos);
+}
+
+TEST_F(TransitionManagerLoggingTest, AlternatingGoodAndBadPosesStaysBounded) {
+    tm_->shouldTriggerTransition(ctxAt(0.0));
+    log_->warn.clear();
+
+    // The pathological pattern for a per-run rate limit: every bad pose starts a
+    // fresh run of length 1, and every good pose ends one. Keying the limit off
+    // the lifetime count is what keeps this bounded.
+    for (int i = 0; i < 600; ++i) {
+        tm_->shouldTriggerTransition(nanCtx());
+        tm_->shouldTriggerTransition(ctxAt(0.0));
+    }
+
+    EXPECT_EQ(tm_->getNonFinitePoseSkipCount(), 600u);
+    EXPECT_LE(log_->warn.size(), 10u) << "rate limit defeated by alternating input";
+}
+
+TEST_F(TransitionManagerLoggingTest, NullLoggerIsSafe) {
+    ChunkCoordinateSystem csys(0.2, chunk_size_);
+    TransitionManager tm(0.2, csys);   // no logger
+
+    EXPECT_NO_THROW({
+        tm.shouldTriggerTransition(ctxAt(0.0));
+        tm.shouldTriggerTransition(nanCtx());
+        tm.shouldTriggerTransition(ctxAt(0.0));
+    });
+    EXPECT_EQ(tm.getNonFinitePoseSkipCount(), 1u);
+}
+
+TEST_F(TransitionManagerLoggingTest, HugeFiniteCoordinateIsReportedNotThrown) {
+    // The realistic trigger for the degenerate-state path, and the reason the
+    // non-finite check alone is not enough. 1e300 is finite, so it clears that
+    // check and also passes tf2's own NaN screening, but the chunk index it
+    // implies cannot be represented in an int32 — so the coordinate system hands
+    // back a chunk that does not contain the position. This used to throw and
+    // terminate the node.
+    //
+    // It takes two bad cycles, which is what a live node does too: the first is
+    // absorbed by chunk-jump detection, which latches the out-of-range chunk as
+    // the reference. The second then compares the position against that same
+    // chunk, is told it lies outside it, and reaches the contradiction.
+    tm_->shouldTriggerTransition(ctxAt(0.0));
+    log_->warn.clear();
+
+    EXPECT_NO_THROW({
+        tm_->shouldTriggerTransition(ctxAt(1e300));   // absorbed as a chunk jump
+        EXPECT_FALSE(tm_->shouldTriggerTransition(ctxAt(1e300)));
+    });
+
+    EXPECT_EQ(tm_->getDegenerateStateSkipCount(), 1u);
+    ASSERT_EQ(log_->warn.size(), 1u);
+    EXPECT_NE(log_->warn[0].find("outside chunk"), std::string::npos);
+}
+
+TEST_F(TransitionManagerLoggingTest, InfinitePositionIsReportedNotThrown) {
+    // tf2 screens NaN translations but not infinite ones, so this is the shape
+    // of bad pose that actually survives a TF lookup and reaches us.
+    tm_->shouldTriggerTransition(ctxAt(0.0));
+    log_->warn.clear();
+
+    EXPECT_NO_THROW({
+        EXPECT_FALSE(tm_->shouldTriggerTransition(
+            ctxAt(std::numeric_limits<double>::infinity())));
+    });
+
+    EXPECT_EQ(tm_->getNonFinitePoseSkipCount(), 1u);
+    ASSERT_EQ(log_->warn.size(), 1u);
+    EXPECT_NE(log_->warn[0].find("not finite"), std::string::npos);
+}
+
+TEST_F(TransitionManagerLoggingTest, HealthyOperationLogsNothing) {
+    // Walking across a chunk boundary must not produce warnings
+    for (int i = 0; i <= 30; ++i) {
+        tm_->shouldTriggerTransition(ctxAt(i * 0.5));
+    }
+    EXPECT_TRUE(log_->warn.empty());
+    EXPECT_TRUE(log_->error.empty());
+    EXPECT_EQ(tm_->getNonFinitePoseSkipCount(), 0u);
+    EXPECT_EQ(tm_->getDegenerateStateSkipCount(), 0u);
 }
 
 // ============================================================================

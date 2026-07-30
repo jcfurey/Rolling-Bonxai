@@ -1,16 +1,22 @@
 {
-    // Rolling Bonxai dev container — ROS 2 Humble (Ubuntu 22.04), Linux/X11
-    // Uses the same image as the rolling_bonxai compose service
-    // so what you build in VS Code is exactly what runs in production.
+    // Rolling Bonxai dev container — ROS 2 Lyrical Luth (Ubuntu 26.04 Resolute)
+    //
+    // Rolling Bonxai supports Jazzy and Lyrical. This is the newer of the two;
+    // .devcontainer/jazzy is the Jazzy equivalent. Fast-DDS is wire-compatible
+    // across distros on the same ROS_DOMAIN_ID, so both containers see the same
+    // topics and can be run side by side.
+    //
+    // Named volumes use a _lyrical suffix to avoid colliding with the Jazzy
+    // devcontainer if both are ever open simultaneously.
     //
     // To open: CTRL+SHIFT+P → "Dev Containers: Reopen in Container"
-    //           → select "rolling_bonxai_humble"
-    "name": "rolling_bonxai_humble",
+    //           → select "rolling_bonxai_lyrical"
+    "name": "rolling_bonxai_lyrical",
 
     // Build the deps stage only — source is bind-mounted in,
     // not baked into the image. This makes rebuilds instant.
     "build": {
-        "dockerfile": "../.docker/Dockerfile.rolling_bonxai",
+        "dockerfile": "../.docker/Dockerfile.rolling_bonxai_lyrical",
         "context": "..",
         "target": "deps"
     },
@@ -23,9 +29,9 @@
     // Named volumes keep build/ install/ log/ off the host filesystem
     // so Linux file permissions and inotify work correctly.
     "mounts": [
-        { "source": "rolling_bonxai_build",   "target": "/ros2_ws/build",   "type": "volume" },
-        { "source": "rolling_bonxai_install",  "target": "/ros2_ws/install", "type": "volume" },
-        { "source": "rolling_bonxai_log",      "target": "/ros2_ws/log",     "type": "volume" },
+        { "source": "rolling_bonxai_build_lyrical",   "target": "/ros2_ws/build",   "type": "volume" },
+        { "source": "rolling_bonxai_install_lyrical", "target": "/ros2_ws/install", "type": "volume" },
+        { "source": "rolling_bonxai_log_lyrical",     "target": "/ros2_ws/log",     "type": "volume" },
         // X11 socket for running GUI tools (e.g. rqt) from within the container
         { "source": "/tmp/.X11-unix", "target": "/tmp/.X11-unix", "type": "bind" }
     ],
@@ -45,10 +51,9 @@
         "--device", "/dev/dri:/dev/dri"
     ],
 
-    // First-time setup: install rosdep deps + build the workspace
+    // on_create and post_start scripts are shared between both variants.
+    // They detect the active ROS distro at runtime via $ROS_DISTRO.
     "onCreateCommand": "bash /ros2_ws/src/Rolling-Bonxai/.docker/devcontainer_on_create.sh",
-
-    // Every start: source the workspace and print a status banner
     "postStartCommand": "bash /ros2_ws/src/Rolling-Bonxai/.docker/devcontainer_post_start.sh",
 
     "customizations": {
