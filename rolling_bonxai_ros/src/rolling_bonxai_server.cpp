@@ -506,9 +506,10 @@ void RollingBonxaiServer::pointcloudCallback(
     tf.transform.rotation.y,
     tf.transform.rotation.z);
 
-  // A diverged localiser can publish a non-finite transform. Every point
-  // derived from it would be NaN, poisoning the chunk the sensor sits in.
-  // Drop the cloud rather than letting that reach the map.
+  // tf2 screens NaN translations at ingestion (TF_NAN_INPUT) but does not
+  // screen infinities, so an infinite transform from a diverging state
+  // estimator reaches us intact. Every point derived from it would be
+  // non-finite, poisoning the chunk the sensor sits in. Drop the cloud.
   if (!origin.allFinite() || !q.coeffs().allFinite()) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 2000,

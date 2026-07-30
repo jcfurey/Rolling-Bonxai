@@ -37,8 +37,11 @@ RollingOccupancyMap::RollingOccupancyMap(const AllParameters& params,
     // Initialize coordinate system
     c_sys_ = std::make_unique<ChunkCoordinateSystem>(params_.map_params.resolution,params_.chunk_size);
 
-    // Initialise transition manager
-    transition_manager_ = std::make_unique<TransitionManager>(params_.hysteresis_ratio, *c_sys_);
+    // Initialise transition manager. It gets the logger so that a skipped
+    // rolling update — a frozen window, indistinguishable from a stationary
+    // robot — is reported rather than silently swallowed.
+    transition_manager_ = std::make_unique<TransitionManager>(
+        params_.hysteresis_ratio, *c_sys_, logger_);
 
     // Initialise the loading policy.
     // "neighbourhood" and "neighborhood" are both accepted: the shipped params

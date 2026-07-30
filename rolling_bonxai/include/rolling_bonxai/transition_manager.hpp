@@ -3,8 +3,11 @@
 #include <cstdint>
 #include <array>
 #include <limits>
+#include <memory>
+#include <string>
 #include "rolling_bonxai/common.hpp"
 #include "rolling_bonxai/coordinate_system.hpp"
+#include "rolling_bonxai/logger.hpp"
 
 /**
  * @file transition_manager.hpp
@@ -100,12 +103,31 @@ public:
      * @param hyst_ratio Hysteresis ratio (0.01 to 1.0). Defines threshold as fraction of chunk size.
      *                   Default 0.10 means robot must penetrate 10% of chunk size (e.g., 1m for 10m chunks)
      * @param csys Reference to the coordinate system for chunk/position conversions
-     * 
+     * @param logger Optional logger for degraded-input reporting. When null,
+     *               skipped cycles are silent — pass one in so a robot feeding
+     *               this a bad pose stream is visible rather than merely
+     *               mysteriously stationary.
+     *
      * Example: For 10m chunks with hyst_ratio=0.2:
      *   - Hysteresis zone = 2m
      *   - Robot must move 2m into new chunk before transition confirms
      */
-    TransitionManager(double hyst_ratio, ChunkCoordinateSystem& csys);
+    TransitionManager(double hyst_ratio,
+                      ChunkCoordinateSystem& csys,
+                      Logger::SharedPtr logger = nullptr);
+
+    /**
+     * @brief Number of update cycles skipped because the ego pose was not finite
+     *
+     * Exposed so a caller can surface this as a diagnostic without scraping logs.
+     */
+    [[nodiscard]] uint64_t getNonFinitePoseSkipCount() const;
+
+    /**
+     * @brief Number of update cycles skipped because the state machine reached a
+     *        geometrically impossible state
+     */
+    [[nodiscard]] uint64_t getDegenerateStateSkipCount() const;
 
     /**
      * @brief Check if a chunk transition should be triggered
@@ -268,6 +290,32 @@ private:
         const TransitionManagerContext& context,
         const ChunkCoord& current_chunk_coord);
 
+    /**
+     * @brief Report a skipped update cycle without flooding the log
+     *
+     * Skips arrive at sensor rate, so one line each would bury everything else —
+     * the very problem that made the previous per-cloud info logging useless.
+     * Instead: warn on the first skip of a run, then every kSkipLogStride-th, so
+     * a persistent fault keeps announcing itself but a burst costs a few lines.
+     *
+     * @param lifetime_count Lifetime skip count for this cause, already incremented.
+     *        The rate limit keys off this rather than the run length, so an
+     *        alternating good/bad pose stream cannot restart the run at 1 every
+     *        cycle and defeat the limit.
+     * @param run_length Consecutive-skip counter for this cause, already incremented
+     * @param what Human-readable description of the cause
+     */
+    void reportSkip(uint64_t lifetime_count, uint64_t run_length, const std::string& what);
+
+    /**
+     * @brief Log a recovery summary if a run of skipped cycles just ended
+     */
+    void reportRecoveryIfNeeded();
+
+    /// Warn on the 1st skip of a run and every Nth after it. At a 10-30 Hz
+    /// sensor rate this is roughly one line every 15-50 s while a fault lasts.
+    static constexpr uint64_t kSkipLogStride = 500;
+
     // --- Member Variables ---
 
     bool initialized_{false};  ///< True after first update
@@ -290,6 +338,14 @@ private:
 
     // Coordinate system reference
     ChunkCoordinateSystem& csys_;  ///< Reference to coordinate system for conversions
+
+    // Degraded-input reporting
+    Logger::SharedPtr logger_;                  ///< Optional; null means stay silent
+    uint64_t nonfinite_pose_skips_{0};          ///< Consecutive non-finite-pose skips
+    uint64_t degenerate_state_skips_{0};        ///< Consecutive impossible-state skips
+    uint64_t total_nonfinite_pose_skips_{0};    ///< Lifetime count
+    uint64_t total_degenerate_state_skips_{0};  ///< Lifetime count
+    bool warned_current_run_{false};            ///< A warning was emitted for the run in progress
 };
 
 } // namespace RollingBonxai

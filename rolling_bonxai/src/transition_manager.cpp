@@ -1,11 +1,77 @@
 #include "rolling_bonxai/transition_manager.hpp"
 
+#include <sstream>
+#include <utility>
+
 namespace RollingBonxai
 {
 
-TransitionManager::TransitionManager(double hyst_ratio, ChunkCoordinateSystem& csys)
+void TransitionManager::reportSkip(uint64_t lifetime_count,
+                                   uint64_t run_length,
+                                   const std::string& what)
+{
+    // Rate-limit on the LIFETIME count, not the current run. A pose stream that
+    // alternates valid/invalid every cycle would otherwise restart the run at 1
+    // each time and log on every single one. This way the budget is at most one
+    // line per kSkipLogStride skips for this cause, whatever the pattern.
+    if ((lifetime_count % kSkipLogStride) != 1) {
+        return;
+    }
+    warned_current_run_ = true;
+
+    if (!logger_) {
+        return;
+    }
+
+    std::ostringstream oss;
+    oss << "[RollingBonxai]: Rolling update skipped — " << what
+        << ". The rolling window is frozen at chunk ("
+        << reference_chunk_coord_.x << "," << reference_chunk_coord_.y << ","
+        << reference_chunk_coord_.z << "); no chunks will load or evict until "
+           "valid poses resume. Consecutive skipped cycles: " << run_length
+        << ", total for this cause: " << lifetime_count << ".";
+    logger_->log_warn(oss.str());
+}
+
+void TransitionManager::reportRecoveryIfNeeded()
+{
+    const uint64_t run = nonfinite_pose_skips_ + degenerate_state_skips_;
+    if (run == 0) {
+        return;
+    }
+
+    // Only pair a recovery line with a run that actually announced itself,
+    // otherwise the rate limit above could be undone by recovery spam.
+    if (warned_current_run_ && logger_) {
+        std::ostringstream oss;
+        oss << "[RollingBonxai]: Rolling update recovered after " << run
+            << " skipped cycle(s) (" << nonfinite_pose_skips_
+            << " non-finite pose, " << degenerate_state_skips_
+            << " degenerate state).";
+        logger_->log_warn(oss.str());
+    }
+
+    nonfinite_pose_skips_ = 0;
+    degenerate_state_skips_ = 0;
+    warned_current_run_ = false;
+}
+
+uint64_t TransitionManager::getNonFinitePoseSkipCount() const
+{
+    return total_nonfinite_pose_skips_;
+}
+
+uint64_t TransitionManager::getDegenerateStateSkipCount() const
+{
+    return total_degenerate_state_skips_;
+}
+
+TransitionManager::TransitionManager(double hyst_ratio,
+                                     ChunkCoordinateSystem& csys,
+                                     Logger::SharedPtr logger)
     : hyst_ratio_(hyst_ratio)
     , csys_(csys)
+    , logger_(std::move(logger))
 {
     // Clamp hysteresis ratio to valid range [0.01, 1.0]
     // Values outside this range are either too sensitive or too large to be useful
@@ -19,15 +85,29 @@ TransitionManager::TransitionManager(double hyst_ratio, ChunkCoordinateSystem& c
 bool TransitionManager::shouldTriggerTransition(const TransitionManagerContext& context)
 {
     // === REJECT NON-FINITE POSES ===
-    // A NaN or infinity here — an uninitialised odometry source, a diverged
-    // localiser — makes every comparison in isPositionInChunk() false, so the
-    // chunk the position was just classified into reports the position as
-    // outside itself. That used to end in the UNINITIALIZED throw below.
-    // Hold the current state and skip the cycle instead; the next valid pose
-    // resumes normally.
+    // A NaN or infinity here makes every comparison in isPositionInChunk()
+    // false, so the chunk the position was just classified into reports the
+    // position as outside itself, which used to end in the UNINITIALIZED throw
+    // below.
+    //
+    // Note on where this comes from: tf2 screens NaN translations at ingestion
+    // (TF_NAN_INPUT), so a NaN cannot arrive through a TF lookup. It does NOT
+    // screen infinities — an infinite translation passes straight through to
+    // callers. Direct users of this library bypass tf2 entirely. Hence the
+    // check covers both rather than just one.
+    //
+    // Hold the current state and skip the cycle; the next valid pose resumes
+    // normally. Skipping is reported, because a frozen rolling window otherwise
+    // looks identical to a stationary robot.
     if (!context.ego_position.allFinite()) {
+        ++nonfinite_pose_skips_;
+        ++total_nonfinite_pose_skips_;
+        reportSkip(total_nonfinite_pose_skips_, nonfinite_pose_skips_,
+                   "ego position is not finite (NaN or infinity)");
         return false;
     }
+
+    reportRecoveryIfNeeded();
 
     // === INITIALIZATION (First Update) ===
     if (!initialized_) {
@@ -83,13 +163,28 @@ bool TransitionManager::shouldTriggerTransition(const TransitionManagerContext& 
     // Sanity check: should never go back to UNINITIALIZED.
     //
     // This is reached when the coordinate system reports the ego as outside the
-    // very chunk it just classified the ego into — a geometric contradiction,
-    // realistically only floating-point behaviour exactly on a chunk boundary.
+    // very chunk it just classified the ego into. That is a geometric
+    // contradiction, but a reachable one: a large finite coordinate (1e300, say,
+    // from a diverging state estimator) is finite so it clears the check above
+    // and passes tf2's own screening, yet positionToChunkCoordinate() cannot
+    // represent the resulting chunk index in an int32, so the chunk it returns
+    // does not contain the position. Verified reachable end to end.
+    //
     // It used to throw, and since this runs inside the point cloud subscription
     // callback the exception escaped the executor and took the whole node down.
     // A mapping node should not die over one bad pose: hold the current state,
-    // trigger no I/O, and let the next update sort itself out.
+    // trigger no I/O, and let the next update sort itself out — but say so, so
+    // a persistent inconsistency does not degrade silently.
     if (new_state == TransitionState::UNINITIALIZED) {
+        ++degenerate_state_skips_;
+        ++total_degenerate_state_skips_;
+        std::ostringstream cause;
+        cause << "coordinate system places ego (" << ego_position_.x() << ","
+              << ego_position_.y() << "," << ego_position_.z()
+              << ") outside chunk (" << current_chunk_coord.x << ","
+              << current_chunk_coord.y << "," << current_chunk_coord.z
+              << ") that it was just classified into";
+        reportSkip(total_degenerate_state_skips_, degenerate_state_skips_, cause.str());
         return false;
     }
 
