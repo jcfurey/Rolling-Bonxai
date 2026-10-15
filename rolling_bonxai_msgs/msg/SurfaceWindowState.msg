@@ -1,0 +1,11 @@
+std_msgs/Header header
+uint64 keyframe_count
+int64 selected_keyframe
+bool following_live
+bool available
+string status
+uint64 snapshot_revision
+builtin_interfaces/Time source_stamp
+builtin_interfaces/Time center_stamp
+uint32 point_count
+uint32 compressed_bytes

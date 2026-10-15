@@ -1,0 +1,5 @@
+<library path="map_window_panel">
+  <class name="rolling_bonxai_rviz/MapWindowPanel" type="RollingBonxai::MapWindowPanel" base_class_type="rviz_common::Panel">
+    <description>Select a pose for a bounded local map, or follow the latest pose.</description>
+  </class>
+</library>
